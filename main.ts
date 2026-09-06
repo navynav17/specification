@@ -10,31 +10,14 @@ const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').tr
 const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
 
 const CANONICAL: Record<string, string> = {
-  brand: 'Brand',
-  'brand name': 'Brand',
-  model: 'Model',
-  'model name': 'Model',
-  colour: 'Color',
-  color: 'Color',
-  'color family': 'Color Family',
-  capacity: 'Capacity',
-  'product type': 'Product Type',
-  type: 'Product Type',
-  warranty: 'Warranty',
-  'warranty period': 'Warranty',
-  weight: 'Weight',
-  dimension: 'Dimensions',
-  dimensions: 'Dimensions'
+  brand: 'Brand', 'brand name': 'Brand', model: 'Model', 'model name': 'Model',
+  colour: 'Color', color: 'Color', 'color family': 'Color Family', capacity: 'Capacity',
+  'product type': 'Product Type', type: 'Product Type', warranty: 'Warranty',
+  'warranty period': 'Warranty', weight: 'Weight', dimension: 'Dimensions', dimensions: 'Dimensions'
 };
-
 const UI_NOISE = /^(more|from|no ratings?|ratings?|add to wishlist|share|report|quantity|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|emi|flash sale|choice|follow|chat now|message)$/i;
 const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined)$/i;
-
-function canonicalKey(key: string) {
-  const k = clean(key, 120).toLowerCase();
-  return CANONICAL[k] || clean(key, 120);
-}
-
+function canonicalKey(key: string) { const k = clean(key, 120).toLowerCase(); return CANONICAL[k] || clean(key, 120); }
 function looksLikeRealValue(value: string) {
   const v = clean(value, 350);
   if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
@@ -42,168 +25,86 @@ function looksLikeRealValue(value: string) {
   if (/\b(no ratings?|add to wishlist|out of stock|in stock|more kitchen appliances|more .* from)/i.test(v)) return false;
   return true;
 }
-
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const k = canonicalKey(clean(key, 120));
-  const v = clean(value, 350);
-  if (!k || !looksLikeRealValue(v)) return;
-  out[k] = v;
+  const k = canonicalKey(clean(key, 120)); const v = clean(value, 350);
+  if (!k || !looksLikeRealValue(v)) return; out[k] = v;
 }
 
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
   try {
-    const context = await browser.newContext({
-      viewport: { width: 1440, height: 1200 },
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
-      locale: 'en-US'
-    });
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1200 }, userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36', locale: 'en-US' });
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(3500);
-
-    for (let i = 0; i < 7; i++) {
-      await page.mouse.wheel(0, 1200);
-      await page.waitForTimeout(700);
-    }
+    for (let i = 0; i < 7; i++) { await page.mouse.wheel(0, 1200); await page.waitForTimeout(700); }
     await page.waitForTimeout(1500);
-
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
-      const roots = Array.from(document.querySelectorAll('.pdp-mod-specification'));
-      const rows = [];
-
+      const roots = Array.from(document.querySelectorAll('.pdp-mod-specification')); const rows = [];
       for (const root of roots) {
-        const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
-          .find(el => clean(el.textContent).toLowerCase() === 'specifications');
+        const title = Array.from(root.querySelectorAll('.pdp-mod-section-title')).find(el => clean(el.textContent).toLowerCase() === 'specifications');
         if (!title) continue;
-
-        const items = root.querySelectorAll('ul.specification-keys > li.key-li');
-        for (const li of items) {
+        for (const li of root.querySelectorAll('ul.specification-keys > li.key-li')) {
           const key = clean(li.querySelector('.key-title')?.textContent || '');
           const value = clean(li.querySelector('.key-value')?.textContent || '');
           if (key && value) rows.push([key, value]);
         }
       }
-
-      const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title'))
-        .some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
-
-      return {
-        rows,
-        rootCount: roots.length,
-        specFound: !!specRoot,
-        sectionText: clean(specRoot?.innerText || '').slice(0, 15000),
-        html: specRoot?.outerHTML?.slice(0, 30000) || '',
-        url: location.href
-      };
+      const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title')).some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
+      return { rows, rootCount: roots.length, specFound: !!specRoot, sectionText: clean(specRoot?.innerText || '').slice(0, 15000), html: specRoot?.outerHTML?.slice(0, 30000) || '', url: location.href };
     })()`);
-
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
-
     await context.close();
     return { specs, finalUrl: result.url, ...result };
-  } finally {
-    await browser.close();
-  }
+  } finally { await browser.close(); }
 }
 
 async function main() {
   await Actor.init();
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
-
   const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
   const productUrl = clean(input.productUrl || input.url || '', 2500);
   if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required');
-
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false }
-  });
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
   const productId = productIdFromUrl(productUrl);
-
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
   console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
-  console.log(`SPEC_TITLE | found=${extracted.specFound} | text=${extracted.specFound ? 'Specifications' : ''}`);
+  console.log(`SPEC_TITLE | found=${extracted.specFound}`);
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
-  console.log(`SPEC_HTML | ${extracted.html}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
-  const { data: existing, error: existingError } = await supabase
-    .from('products')
-    .select('id,title,price,image,link,reviews,rating,specifications')
-    .eq('link', productUrl)
-    .limit(1)
-    .maybeSingle();
+  const { data: existing, error: existingError } = await supabase.from('products').select('id,title,price,image,link,reviews,rating,specifications').eq('link', productUrl).limit(1).maybeSingle();
   if (existingError) throw existingError;
-
-  const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
-    ? existing.specifications as Record<string, unknown>
-    : {};
+  const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications) ? existing.specifications as Record<string, unknown> : {};
 
   if (!Object.keys(extracted.specs).length) {
-    await Actor.pushData({
-      url: productUrl,
-      status: 'no_verified_specs',
-      specifications: current,
-      diagnostic: {
-        rootCount: extracted.rootCount,
-        specFound: extracted.specFound,
-        sectionText: extracted.sectionText
-      }
-    });
-    console.log('SPEC_DONE | no verified specs');
-    await Actor.exit();
-    return;
+    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current, diagnostic: { rootCount: extracted.rootCount, specFound: extracted.specFound, sectionText: extracted.sectionText } });
+    await Actor.exit(); return;
   }
 
-  const merged: Record<string, unknown> = { ...current, ...extracted.specs };
-  const payload = {
-    title: clean(existing?.title || input.title || 'Daraz Product', 500),
-    price: Number(existing?.price || 0),
-    currency: 'NPR',
-    image: existing?.image || null,
-    link: productUrl,
-    reviews: existing?.reviews ?? null,
-    rating: existing?.rating ?? null,
-    search_term: 'product-url-specification',
-    website: 'Daraz Nepal',
-    marketplace_id: MARKETPLACE_ID,
-    external_id: productId,
-    specifications: merged
-  };
+  // Replace stale/merged specification data with the exact fields extracted from the live Daraz Specifications section.
+  const specs = extracted.specs;
+  if (existing?.id) {
+    const { error: saveError } = await supabase.from('products').update({ specifications: specs, updated_at: new Date().toISOString() }).eq('id', existing.id);
+    if (saveError) throw saveError;
+  } else {
+    const payload = { title: clean(input.title || 'Daraz Product', 500), price: 0, currency: 'NPR', image: null, link: productUrl, reviews: null, rating: null, search_term: 'product-url-specification', website: 'Daraz Nepal', marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: specs };
+    const { data: saved, error: saveError } = await supabase.from('products').upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
+    if (saveError) throw saveError;
+    existing && Object.assign(existing, { id: saved.id });
+  }
 
-  const { data: saved, error: saveError } = await supabase
-    .from('products')
-    .upsert(payload, { onConflict: 'marketplace_id,external_id' })
-    .select('id')
-    .single();
-  if (saveError) throw saveError;
-
-  await supabase.from('product_enrichment_queue').upsert({
-    product_id: saved.id,
-    brand: merged.Brand || null,
-    model: merged.Model || null,
-    product_type: merged['Product Type'] || null,
-    parse_status: 'parsed',
-    reason: 'Apify product URL specification actor',
-    specifications: merged,
-    updated_at: new Date().toISOString()
-  }, { onConflict: 'product_id' });
-
-  await Actor.pushData({
-    url: productUrl,
-    status: 'updated',
-    specifications: merged
-  });
-
-  console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
+  const targetId = existing?.id;
+  if (targetId) {
+    await supabase.from('product_enrichment_queue').upsert({ product_id: targetId, brand: specs.Brand || null, model: specs.Model || null, product_type: specs['Product Type'] || null, parse_status: 'parsed', reason: 'Apify product URL specification actor', specifications: specs, updated_at: new Date().toISOString() }, { onConflict: 'product_id' });
+  }
+  await Actor.pushData({ url: productUrl, status: 'updated', specifications: specs });
+  console.log(`SPEC_DONE | saved=${Object.keys(specs).length}`);
   await Actor.exit();
 }
 
-main().catch(async error => {
-  console.error(error);
-  try { await Actor.fail(); } catch {}
-});
+main().catch(async error => { console.error(error); try { await Actor.fail(); } catch {} });
