@@ -77,33 +77,27 @@ async function main() {
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
-  const { data: existing, error: existingError } = await supabase.from('products').select('id,title,price,image,link,reviews,rating,specifications').eq('link', productUrl).limit(1).maybeSingle();
+  const { data: existing, error: existingError } = await supabase.from('products').select('id,title,price,image,link,reviews,rating').eq('link', productUrl).limit(1).maybeSingle();
   if (existingError) throw existingError;
-  const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications) ? existing.specifications as Record<string, unknown> : {};
 
   if (!Object.keys(extracted.specs).length) {
-    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current, diagnostic: { rootCount: extracted.rootCount, specFound: extracted.specFound, sectionText: extracted.sectionText } });
+    await supabase.from('updated_specifications').upsert({ product_id: existing?.id || null, product_url: productUrl, specifications: {}, source: 'apify-specification', updated_at: new Date().toISOString() }, { onConflict: 'product_url' });
+    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: {} });
     await Actor.exit(); return;
   }
 
-  // Replace stale/merged specification data with the exact fields extracted from the live Daraz Specifications section.
   const specs = extracted.specs;
-  if (existing?.id) {
-    const { error: saveError } = await supabase.from('products').update({ specifications: specs, updated_at: new Date().toISOString() }).eq('id', existing.id);
-    if (saveError) throw saveError;
-  } else {
-    const payload = { title: clean(input.title || 'Daraz Product', 500), price: 0, currency: 'NPR', image: null, link: productUrl, reviews: null, rating: null, search_term: 'product-url-specification', website: 'Daraz Nepal', marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: specs };
-    const { data: saved, error: saveError } = await supabase.from('products').upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
-    if (saveError) throw saveError;
-    existing && Object.assign(existing, { id: saved.id });
-  }
+  const { error: saveError } = await supabase.from('updated_specifications').upsert({
+    product_id: existing?.id || null,
+    product_url: productUrl,
+    specifications: specs,
+    source: 'apify-specification',
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'product_url' });
+  if (saveError) throw saveError;
 
-  const targetId = existing?.id;
-  if (targetId) {
-    await supabase.from('product_enrichment_queue').upsert({ product_id: targetId, brand: specs.Brand || null, model: specs.Model || null, product_type: specs['Product Type'] || null, parse_status: 'parsed', reason: 'Apify product URL specification actor', specifications: specs, updated_at: new Date().toISOString() }, { onConflict: 'product_id' });
-  }
-  await Actor.pushData({ url: productUrl, status: 'updated', specifications: specs });
-  console.log(`SPEC_DONE | saved=${Object.keys(specs).length}`);
+  await Actor.pushData({ url: productUrl, status: 'updated', productId: existing?.id || null, specifications: specs });
+  console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications`);
   await Actor.exit();
 }
 
