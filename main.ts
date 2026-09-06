@@ -61,7 +61,7 @@ async function extractProduct(url: string) {
 
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
-      const normalize = (v) => clean(v).toLowerCase();
+      const norm = (v) => clean(v).toLowerCase();
       const rows = [];
       const add = (k, v) => {
         k = clean(k); v = clean(v);
@@ -69,36 +69,43 @@ async function extractProduct(url: string) {
         rows.push([k, v]);
       };
 
+      // Known Daraz scope, then locate the Specifications label inside it.
       const root = document.querySelector('div.pdp-product-details');
       let heading = null;
       let section = null;
+      let headingParentHtml = '';
+      let headingParentText = '';
+      let followingHtml = '';
 
       if (root) {
         const candidates = Array.from(root.querySelectorAll('*'));
-        heading = candidates.find(el => normalize(el.textContent) === 'specifications') || null;
+        heading = candidates.find(el => norm(el.textContent) === 'specifications') || null;
 
         if (heading) {
-          // Use the nearest ancestor that contains the heading and the specification rows,
-          // but do not climb above the product-details container.
-          let node = heading;
-          for (let i = 0; i < 4 && node.parentElement; i++) {
-            const parent = node.parentElement;
-            const descendants = parent.querySelectorAll('tr,dt,[class*="spec"],li,p');
-            const text = clean(parent.innerText || parent.textContent || '');
-            if (text.length > 20 && text.length < 12000 && descendants.length > 0) section = parent;
-          }
-
-          // When Specifications is a direct child heading, include the following sibling content.
           const parent = heading.parentElement;
           if (parent) {
+            headingParentHtml = parent.outerHTML.slice(0, 20000);
+            headingParentText = clean(parent.innerText || parent.textContent || '');
             const children = Array.from(parent.children);
             const idx = children.indexOf(heading);
-            if (idx >= 0 && idx < children.length - 1) {
-              const following = children.slice(idx + 1);
-              const text = following.map(x => clean(x.innerText || x.textContent || '')).filter(Boolean).join('\\n');
-              if (text.length > 20 && text.length < 12000) section = parent;
+            if (idx >= 0) {
+              followingHtml = children.slice(idx + 1).map(x => x.outerHTML).join('\\n').slice(0, 30000);
             }
           }
+
+          // Instead of guessing a large ancestor, choose the first ancestor that has
+          // structured rows or spec-like two-column children.
+          let node = heading;
+          for (let i = 0; i < 6 && node.parentElement; i++) {
+            const p = node.parentElement;
+            const rowCount = p.querySelectorAll('tr').length;
+            const detailPairs = Array.from(p.children).filter(x => x.children.length === 2).length;
+            if (rowCount > 0 || detailPairs > 0) {
+              section = p;
+              break;
+            }
+          }
+          if (!section) section = heading.parentElement;
         }
       }
 
@@ -111,18 +118,10 @@ async function extractProduct(url: string) {
           const dd = el.nextElementSibling;
           if (dd) add(el.textContent, dd.textContent);
         }
-        for (const el of Array.from(section.querySelectorAll('*'))) {
-          if (el.children.length !== 0) continue;
-          const parent = el.parentElement;
-          if (!parent || parent.children.length !== 2) continue;
-          const siblings = Array.from(parent.children).map(x => clean(x.textContent));
-          if (siblings.length === 2) add(siblings[0], siblings[1]);
-        }
-        for (const el of Array.from(section.querySelectorAll('li,p,span,div'))) {
-          const t = clean(el.textContent);
-          if (!t || t.length > 220) continue;
-          const m = t.match(/^([^:]{2,100}):\\s*(.{1,180})$/);
-          if (m) add(m[1], m[2]);
+        for (const parent of Array.from(section.querySelectorAll('*'))) {
+          if (parent.children.length !== 2) continue;
+          const parts = Array.from(parent.children).map(x => clean(x.textContent));
+          if (parts.length === 2 && parts[0].length <= 120 && parts[1].length <= 350) add(parts[0], parts[1]);
         }
       }
 
@@ -132,7 +131,10 @@ async function extractProduct(url: string) {
         rootFound: !!root,
         headingFound: !!heading,
         headingText: clean(heading?.textContent || ''),
-        sectionText: clean(section?.innerText || section?.textContent || '')
+        sectionText: clean(section?.innerText || section?.textContent || ''),
+        headingParentText,
+        headingParentHtml,
+        followingHtml
       };
     })()`);
 
@@ -140,8 +142,20 @@ async function extractProduct(url: string) {
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
     await context.close();
-    return { specs, finalUrl: result.url, rootFound: result.rootFound, headingFound: result.headingFound, headingText: result.headingText, sectionText: result.sectionText };
-  } finally { await browser.close(); }
+    return {
+      specs,
+      finalUrl: result.url,
+      rootFound: result.rootFound,
+      headingFound: result.headingFound,
+      headingText: result.headingText,
+      sectionText: result.sectionText,
+      headingParentText: result.headingParentText,
+      headingParentHtml: result.headingParentHtml,
+      followingHtml: result.followingHtml
+    };
+  } finally {
+    await browser.close();
+  }
 }
 
 async function main() {
@@ -158,6 +172,9 @@ async function main() {
   console.log(`SPEC_CONTAINER | found=${extracted.rootFound}`);
   console.log(`SPEC_TITLE | found=${extracted.headingFound} | text=${JSON.stringify(extracted.headingText)}`);
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
+  console.log(`SPEC_HEADING_PARENT_TEXT | ${JSON.stringify(extracted.headingParentText)}`);
+  console.log(`SPEC_HEADING_PARENT_HTML | ${extracted.headingParentHtml}`);
+  console.log(`SPEC_FOLLOWING_HTML | ${extracted.followingHtml}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
