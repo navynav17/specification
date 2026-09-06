@@ -146,6 +146,7 @@ async function main() {
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl} | bodyChars=${extracted.bodyLength}`);
+  console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
   const { data: existing, error: existingError } = await supabase.from('products')
     .select('id,title,price,image,link,reviews,rating,specifications')
@@ -155,34 +156,18 @@ async function main() {
     ? existing.specifications as Record<string, unknown> : {};
 
   if (!Object.keys(extracted.specs).length) {
-    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current });
+    await Actor.pushData({url:productUrl,status:'no_verified_specs',specifications:current});
     console.log('SPEC_DONE | no verified specs');
     await Actor.exit(); return;
   }
 
-  const merged: Record<string, unknown> = { ...current, ...extracted.specs };
-  const payload = {
-    title: clean(existing?.title || input.title || extracted.title || 'Daraz Product', 500),
-    price: Number(existing?.price || 0), currency: 'NPR', image: existing?.image || null,
-    link: productUrl, reviews: existing?.reviews ?? null, rating: existing?.rating ?? null,
-    search_term: 'product-url-specification', website: 'Daraz Nepal',
-    marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: merged
-  };
-
-  const { data: saved, error: saveError } = await supabase.from('products')
-    .upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
-  if (saveError) throw saveError;
-
-  await supabase.from('product_enrichment_queue').upsert({
-    product_id: saved.id, brand: merged.Brand || null, model: merged.Model || null,
-    product_type: merged['Product Type'] || null, parse_status: 'parsed',
-    reason: 'Apify product URL specification actor', specifications: merged,
-    updated_at: new Date().toISOString()
-  }, { onConflict: 'product_id' });
-
-  await Actor.pushData({ url: productUrl, status: 'updated', specifications: merged });
+  const merged: Record<string, unknown> = {...current,...extracted.specs};
+  const payload={title:clean(existing?.title||input.title||extracted.title||'Daraz Product',500),price:Number(existing?.price||0),currency:'NPR',image:existing?.image||null,link:productUrl,reviews:existing?.reviews??null,rating:existing?.rating??null,search_term:'product-url-specification',website:'Daraz Nepal',marketplace_id:MARKETPLACE_ID,external_id:productId,specifications:merged};
+  const {data:saved,error:saveError}=await supabase.from('products').upsert(payload,{onConflict:'marketplace_id,external_id'}).select('id').single();
+  if(saveError) throw saveError;
+  await supabase.from('product_enrichment_queue').upsert({product_id:saved.id,brand:merged.Brand||null,model:merged.Model||null,product_type:merged['Product Type']||null,parse_status:'parsed',reason:'Apify product URL specification actor',specifications:merged,updated_at:new Date().toISOString()},{onConflict:'product_id'});
+  await Actor.pushData({url:productUrl,status:'updated',specifications:merged});
   console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
 }
-
-main().catch(async error => { console.error(error); try { await Actor.fail(); } catch {} });
+main().catch(async error=>{console.error(error);try{await Actor.fail();}catch{}});
