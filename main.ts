@@ -41,16 +41,6 @@ function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
   if (!k || BAD_KEY.test(k) || !looksLikeRealSpecValue(v) || !looksLikeRealSpecKey(k)) return;
   out[k] = out[k] && out[k] !== v ? `${out[k]}; ${v}` : v;
 }
-function collectNestedSpecs(root: unknown, out: Record<string, string>) {
-  if (!root || typeof root !== 'object') return;
-  if (Array.isArray(root)) { for (const x of root) collectNestedSpecs(x, out); return; }
-  for (const [k, v] of Object.entries(root as Record<string, unknown>)) {
-    if (BAD_KEY.test(k)) continue;
-    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-      if (looksLikeRealSpecKey(k)) addSpec(out, k, v);
-    } else collectNestedSpecs(v, out);
-  }
-}
 
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
@@ -63,7 +53,6 @@ async function extractProduct(url: string) {
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(3500);
-
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(700);
@@ -80,32 +69,34 @@ async function extractProduct(url: string) {
         rows.push([k, v]);
       };
 
-      // Scope to Daraz's product-details container first.
       const root = document.querySelector('div.pdp-product-details');
       let heading = null;
       let section = null;
 
       if (root) {
-        const candidates = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,strong,b'));
+        const candidates = Array.from(root.querySelectorAll('*'));
         heading = candidates.find(el => normalize(el.textContent) === 'specifications') || null;
 
         if (heading) {
-          // Start from the heading and find the nearest useful section within the root.
+          // Use the nearest ancestor that contains the heading and the specification rows,
+          // but do not climb above the product-details container.
           let node = heading;
-          for (let i = 0; i < 5 && node.parentElement; i++) {
+          for (let i = 0; i < 4 && node.parentElement; i++) {
             const parent = node.parentElement;
+            const descendants = parent.querySelectorAll('tr,dt,[class*="spec"],li,p');
             const text = clean(parent.innerText || parent.textContent || '');
-            if (text.length > 20 && text.length < 20000) section = parent;
+            if (text.length > 20 && text.length < 12000 && descendants.length > 0) section = parent;
           }
 
-          // Prefer a sibling-based section when the heading is its own block.
+          // When Specifications is a direct child heading, include the following sibling content.
           const parent = heading.parentElement;
           if (parent) {
-            const siblings = Array.from(parent.children);
-            const idx = siblings.indexOf(heading);
-            if (idx >= 0) {
-              const localText = siblings.slice(idx).map(x => clean(x.innerText || x.textContent || '')).filter(Boolean).join('\\n');
-              if (localText.length > 20) section = parent;
+            const children = Array.from(parent.children);
+            const idx = children.indexOf(heading);
+            if (idx >= 0 && idx < children.length - 1) {
+              const following = children.slice(idx + 1);
+              const text = following.map(x => clean(x.innerText || x.textContent || '')).filter(Boolean).join('\\n');
+              if (text.length > 20 && text.length < 12000) section = parent;
             }
           }
         }
@@ -120,25 +111,23 @@ async function extractProduct(url: string) {
           const dd = el.nextElementSibling;
           if (dd) add(el.textContent, dd.textContent);
         }
+        for (const el of Array.from(section.querySelectorAll('*'))) {
+          if (el.children.length !== 0) continue;
+          const parent = el.parentElement;
+          if (!parent || parent.children.length !== 2) continue;
+          const siblings = Array.from(parent.children).map(x => clean(x.textContent));
+          if (siblings.length === 2) add(siblings[0], siblings[1]);
+        }
         for (const el of Array.from(section.querySelectorAll('li,p,span,div'))) {
           const t = clean(el.textContent);
           if (!t || t.length > 220) continue;
           const m = t.match(/^([^:]{2,100}):\\s*(.{1,180})$/);
           if (m) add(m[1], m[2]);
-          if (el.children.length === 0) {
-            const parent = el.parentElement;
-            if (parent && parent.children.length === 2) {
-              const siblings = Array.from(parent.children).map(x => clean(x.textContent));
-              if (siblings.length === 2) add(siblings[0], siblings[1]);
-            }
-          }
         }
       }
 
       return {
         rows,
-        html: root?.outerHTML || '',
-        scripts: Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n'),
         url: location.href,
         rootFound: !!root,
         headingFound: !!heading,
@@ -149,34 +138,6 @@ async function extractProduct(url: string) {
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
-
-    const rawSources = `${result.html}\n${result.scripts}`;
-    for (const marker of ['specifications', 'specification', 'attributes', 'skuAttributeMap']) {
-      let from = 0;
-      while (true) {
-        const idx = rawSources.indexOf(marker, from);
-        if (idx < 0) break;
-        const start = rawSources.indexOf('{', idx);
-        if (start < 0) break;
-        let depth = 0, inString = false, escaped = false, foundEnd = -1;
-        for (let i = start; i < Math.min(rawSources.length, start + 500000); i++) {
-          const ch = rawSources[i];
-          if (inString) {
-            if (escaped) escaped = false;
-            else if (ch === '\\') escaped = true;
-            else if (ch === '"') inString = false;
-            continue;
-          }
-          if (ch === '"') inString = true;
-          else if (ch === '{') depth++;
-          else if (ch === '}' && --depth === 0) { foundEnd = i; break; }
-        }
-        if (foundEnd > 0) {
-          try { collectNestedSpecs(JSON.parse(rawSources.slice(start, foundEnd + 1)), specs); } catch {}
-        }
-        from = idx + marker.length;
-      }
-    }
 
     await context.close();
     return { specs, finalUrl: result.url, rootFound: result.rootFound, headingFound: result.headingFound, headingText: result.headingText, sectionText: result.sectionText };
@@ -222,13 +183,11 @@ async function main() {
   };
   const { data: saved, error: saveError } = await supabase.from('products').upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
   if (saveError) throw saveError;
-
   await supabase.from('product_enrichment_queue').upsert({
     product_id: saved.id, brand: merged.Brand || null, model: merged.Model || null,
     product_type: merged['Product Type'] || null, parse_status: 'parsed',
     reason: 'Apify product URL specification actor', specifications: merged, updated_at: new Date().toISOString()
   }, { onConflict: 'product_id' });
-
   await Actor.pushData({ url: productUrl, status: 'updated', specifications: merged });
   console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
