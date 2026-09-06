@@ -56,26 +56,16 @@ async function extractProduct(url: string) {
     const page = await context.newPage();
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(6000);
+    await page.waitForTimeout(4500);
 
-    for (let i = 0; i < 16; i++) {
-      await page.mouse.wheel(0, 1000);
-      await page.waitForTimeout(450);
+    // Use the DOM pattern that was verified on the Aura refrigerator page.
+    // Scroll enough to force lazy rendering, then inspect the actual
+    // .pdp-mod-specification -> .specification-keys -> .key-li structure.
+    for (let i = 0; i < 18; i++) {
+      await page.mouse.wheel(0, 900);
+      await page.waitForTimeout(400);
     }
-    await page.waitForTimeout(3000);
-
-    // Trigger any lazy sections and expand the specification section when possible.
-    try {
-      const labels = page.getByText('Specifications', { exact: true });
-      const count = await labels.count();
-      for (let i = 0; i < Math.min(count, 5); i++) {
-        try {
-          await labels.nth(i).scrollIntoViewIfNeeded();
-          await labels.nth(i).click({ timeout: 2000 });
-          await page.waitForTimeout(1500);
-        } catch {}
-      }
-    } catch {}
+    await page.waitForTimeout(2500);
 
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
@@ -86,53 +76,27 @@ async function extractProduct(url: string) {
         if (!k || !v) return;
         const sig = k + '\\u0000' + v;
         if (seen.has(sig)) return;
-        seen.add(sig); rows.push([k, v]);
+        seen.add(sig);
+        rows.push([k, v]);
       };
 
-      // 1) Preferred current Daraz specification component.
-      for (const root of Array.from(document.querySelectorAll('.pdp-mod-specification'))) {
-        const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
+      const roots = Array.from(document.querySelectorAll('.pdp-mod-specification'));
+      for (const root of roots) {
+        const heading = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
-        if (!title) continue;
+        if (!heading) continue;
         for (const li of root.querySelectorAll('ul.specification-keys > li.key-li')) {
-          push(li.querySelector('.key-title')?.textContent, li.querySelector('.key-value')?.textContent);
-        }
-      }
-
-      // 2) Known Daraz-style key/value tables, restricted to containers whose heading is Specifications.
-      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,p,div,span'))
-        .filter(el => clean(el.textContent).toLowerCase() === 'specifications');
-      for (const heading of headings.slice(0, 8)) {
-        let parent = heading.parentElement;
-        for (let depth = 0; depth < 6 && parent; depth++, parent = parent.parentElement) {
-          for (const tr of parent.querySelectorAll('tr')) {
-            const cells = Array.from(tr.querySelectorAll('th,td')).map(c => clean(c.textContent)).filter(Boolean);
-            if (cells.length === 2) push(cells[0], cells[1]);
-          }
-          for (const item of parent.querySelectorAll('li')) {
-            const direct = Array.from(item.children).map(x => clean(x.textContent)).filter(Boolean);
-            if (direct.length === 2) push(direct[0], direct[1]);
-          }
-        }
-      }
-
-      // 3) Product specification data embedded in page scripts.
-      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i;
-      for (const script of Array.from(document.scripts)) {
-        const text = script.textContent || '';
-        if (!/specification|specifications|keyValue|specs/i.test(text)) continue;
-        const pairs = text.matchAll(/(?:\\\"|')([^\\\"']{2,100})(?:\\\"|')\\s*[:=]\\s*(?:\\\"|')([^\\\"']{1,350})(?:\\\"|')/g);
-        for (const m of pairs) {
-          const k = clean(m[1]);
-          const v = clean(m[2]);
-          if (allowed.test(k)) push(k, v);
+          const key = li.querySelector('.key-title')?.textContent || '';
+          const value = li.querySelector('.key-value')?.textContent || '';
+          push(key, value);
         }
       }
 
       return {
         rows,
+        rootCount: roots.length,
+        bodyText: clean(document.body?.innerText || '').slice(0, 12000),
         title: clean(document.title || ''),
-        bodyText: clean(document.body?.innerText || '').slice(0, 16000),
         url: location.href
       };
     })()`);
@@ -140,11 +104,14 @@ async function extractProduct(url: string) {
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
-    // Require at least one meaningful specification value. Do not treat Daraz internals as success.
-    const cleanedSpecs = Object.fromEntries(Object.entries(specs).filter(([k, v]) => looksLikeRealPair(k, v)));
-
     await context.close();
-    return { specs: cleanedSpecs, finalUrl: result.url, title: result.title, bodyText: result.bodyText };
+    return {
+      specs,
+      finalUrl: result.url,
+      title: result.title,
+      rootCount: result.rootCount,
+      bodyText: result.bodyText
+    };
   } finally {
     await browser.close();
   }
@@ -154,7 +121,9 @@ async function main() {
   await Actor.init();
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
 
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false }
+  });
 
   // Process all pending Daraz products in this run.
   const pageSize = 200;
@@ -167,7 +136,7 @@ async function main() {
   while (true) {
     const { data: pending, error: queueError } = await supabase
       .from('products')
-      .select('id,title,price,image,link,reviews,rating,created_at')
+      .select('id,title,link,created_at')
       .not('link', 'is', null)
       .like('link', '%daraz.com.np%')
       .not('link', 'like', '%/categories/%')
@@ -179,22 +148,21 @@ async function main() {
     const candidates = pending.filter((p: any) => {
       try {
         const u = new URL(p.link);
-        return (u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`) && /\/products\//i.test(u.pathname) && /-i\d+\.html/i.test(u.pathname);
-      } catch { return false; }
+        return (u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`) &&
+          /\/products\//i.test(u.pathname) && /-i\d+\.html/i.test(u.pathname);
+      } catch {
+        return false;
+      }
     });
 
-    if (!candidates.length) {
-      offset += pageSize;
-      continue;
-    }
-
     for (const selected of candidates) {
-      const { data: already } = await supabase
+      const { data: already, error: alreadyError } = await supabase
         .from('updated_specifications')
         .select('id')
         .eq('product_id', selected.id)
         .limit(1)
         .maybeSingle();
+      if (alreadyError) throw alreadyError;
       if (already) continue;
 
       totalSelected++;
@@ -203,35 +171,53 @@ async function main() {
 
       try {
         const extracted = await extractProduct(productUrl);
-        console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
-        console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
-
-        totalProcessed++;
         const specs = extracted.specs;
+        totalProcessed++;
+
+        console.log(`SPEC_ROOT | count=${extracted.rootCount}`);
+        console.log(`SPEC_EXTRACTED | count=${Object.keys(specs).length} | final=${extracted.finalUrl}`);
+        console.log(`SPECIFICATIONS | ${JSON.stringify(specs)}`);
 
         if (Object.keys(specs).length === 0) {
           totalNoSpecs++;
-          await Actor.pushData({ url: productUrl, status: 'no_verified_specs', productId: selected.id, specifications: {} });
+          await Actor.pushData({
+            url: productUrl,
+            status: 'no_verified_specs',
+            productId: selected.id,
+            specifications: {}
+          });
           console.log(`SPEC_SKIP | product_id=${selected.id} | reason=no_verified_specs`);
           continue;
         }
 
-        const { error: saveError } = await supabase.from('updated_specifications').upsert({
-          product_id: selected.id,
-          product_url: productUrl,
-          specifications: specs,
-          source: 'apify-specification',
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'product_url' });
+        const { error: saveError } = await supabase
+          .from('updated_specifications')
+          .upsert({
+            product_id: selected.id,
+            product_url: productUrl,
+            specifications: specs,
+            source: 'apify-specification',
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'product_url' });
         if (saveError) throw saveError;
 
         totalSaved++;
-        await Actor.pushData({ url: productUrl, status: 'updated', productId: selected.id, specifications: specs });
+        await Actor.pushData({
+          url: productUrl,
+          status: 'updated',
+          productId: selected.id,
+          specifications: specs
+        });
         console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications | product_id=${selected.id}`);
       } catch (error) {
         totalProcessed++;
         console.error(`SPEC_ERROR | product_id=${selected.id} | error=${String(error)}`);
-        await Actor.pushData({ url: productUrl, status: 'error', productId: selected.id, error: String(error) });
+        await Actor.pushData({
+          url: productUrl,
+          status: 'error',
+          productId: selected.id,
+          error: String(error)
+        });
       }
     }
 
@@ -239,7 +225,14 @@ async function main() {
     if (pending.length < pageSize) break;
   }
 
-  await Actor.pushData({ status: 'completed', mode: 'all_pending_daraz', selected: totalSelected, processed: totalProcessed, saved: totalSaved, noVerifiedSpecs: totalNoSpecs });
+  await Actor.pushData({
+    status: 'completed',
+    mode: 'all_pending_daraz',
+    selected: totalSelected,
+    processed: totalProcessed,
+    saved: totalSaved,
+    noVerifiedSpecs: totalNoSpecs
+  });
   console.log(`SPEC_BATCH_DONE | selected=${totalSelected} | processed=${totalProcessed} | saved=${totalSaved} | no_verified_specs=${totalNoSpecs}`);
   await Actor.exit();
 }
