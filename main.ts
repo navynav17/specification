@@ -41,29 +41,90 @@ async function extractProduct(url: string) {
     });
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3500);
-    for (let i = 0; i < 7; i++) { await page.mouse.wheel(0, 1200); await page.waitForTimeout(700); }
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(5000);
+
+    // Force lazy-loaded product sections to render.
+    for (let i = 0; i < 12; i++) {
+      await page.mouse.wheel(0, 1000);
+      await page.waitForTimeout(500);
+    }
+    await page.waitForTimeout(2500);
+
+    // Try clicking the Specifications tab/heading when Daraz renders it lazily.
+    try {
+      const labels = page.getByText('Specifications', { exact: true });
+      const count = await labels.count();
+      for (let i = 0; i < Math.min(count, 3); i++) {
+        try { await labels.nth(i).scrollIntoViewIfNeeded(); await labels.nth(i).click({ timeout: 1500 }); await page.waitForTimeout(1500); } catch {}
+      }
+    } catch {}
+
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
-      const roots = Array.from(document.querySelectorAll('.pdp-mod-specification')); const rows = [];
-      for (const root of roots) {
+      const rows = [];
+      const seen = new Set();
+      const push = (k, v) => {
+        k = clean(k); v = clean(v);
+        if (!k || !v || seen.has(k + '\\u0000' + v)) return;
+        seen.add(k + '\\u0000' + v); rows.push([k, v]);
+      };
+
+      // Current Daraz rendered structure.
+      for (const root of Array.from(document.querySelectorAll('.pdp-mod-specification'))) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title')).find(el => clean(el.textContent).toLowerCase() === 'specifications');
         if (!title) continue;
         for (const li of root.querySelectorAll('ul.specification-keys > li.key-li')) {
-          const key = clean(li.querySelector('.key-title')?.textContent || '');
-          const value = clean(li.querySelector('.key-value')?.textContent || '');
-          if (key && value) rows.push([key, value]);
+          push(li.querySelector('.key-title')?.textContent, li.querySelector('.key-value')?.textContent);
         }
       }
-      const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title')).some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
-      return { rows, rootCount: roots.length, specFound: !!specRoot, sectionText: clean(specRoot?.innerText || '').slice(0, 15000), html: specRoot?.outerHTML?.slice(0, 30000) || '', url: location.href };
+
+      // Generic specification tables/lists used by alternate Daraz layouts.
+      const specHeading = Array.from(document.querySelectorAll('h1,h2,h3,h4,div,span')).find(el => clean(el.textContent).toLowerCase() === 'specifications');
+      if (specHeading) {
+        let parent = specHeading.parentElement;
+        for (let depth = 0; depth < 5 && parent; depth++, parent = parent.parentElement) {
+          for (const row of parent.querySelectorAll('tr')) {
+            const cells = Array.from(row.querySelectorAll('th,td')).map(c => clean(c.textContent)).filter(Boolean);
+            if (cells.length >= 2) push(cells[0], cells.slice(1).join(' '));
+          }
+          for (const item of parent.querySelectorAll('li')) {
+            const spans = Array.from(item.querySelectorAll('span,div')).map(x => clean(x.textContent)).filter(Boolean);
+            if (spans.length >= 2) push(spans[0], spans[spans.length - 1]);
+          }
+        }
+      }
+
+      // Embedded JSON fallback: search script contents around specification-like key/value structures.
+      for (const script of Array.from(document.scripts)) {
+        const text = script.textContent || '';
+        if (!/specification|specifications|keyValue|key-title/i.test(text)) continue;
+        const pairs = text.matchAll(/(?:\"|')([^\"']{2,80})(?:\"|')\\s*[:=]\\s*(?:\"|')([^\"']{1,300})(?:\"|')/g);
+        for (const m of pairs) {
+          const k = clean(m[1]); const v = clean(m[2]);
+          if (/^(brand|model|color|colour|capacity|product type|type|warranty|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|refrigerator|washing machine|air conditioner)/i.test(k)) push(k, v);
+        }
+      }
+
+      const hasSpecText = /(?:^|\\W)Specifications(?:\\W|$)/i.test(document.body?.innerText || '');
+      return {
+        rows,
+        specFound: rows.length > 0 || !!specHeading,
+        sectionText: clean(specHeading?.parentElement?.innerText || '').slice(0, 15000),
+        bodyText: clean(document.body?.innerText || '').slice(0, 12000),
+        hasSpecText,
+        url: location.href,
+        html: document.documentElement.outerHTML.slice(0, 40000)
+      };
     })()`);
+
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
+
     await context.close();
-    return { specs, finalUrl: result.url, ...result };
-  } finally { await browser.close(); }
+    return { specs, finalUrl: result.url, ...result, rootCount: Object.keys(specs).length };
+  } finally {
+    await browser.close();
+  }
 }
 
 async function main() {
@@ -86,12 +147,11 @@ async function main() {
   const candidates = (pending || []).filter((p: any) => {
     try {
       const u = new URL(p.link);
-      return u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`;
+      return (u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`) && /\/products\//i.test(u.pathname);
     } catch { return false; }
   });
 
-  const urls = candidates.map((p: any) => p.link);
-  if (!urls.length) {
+  if (!candidates.length) {
     await Actor.pushData({ status: 'no_pending_daraz_products' });
     await Actor.exit();
     return;
@@ -119,10 +179,13 @@ async function main() {
   console.log(`SPEC_START | daraz_url=${productUrl} | product_id=${selected.id}`);
 
   const extracted = await extractProduct(productUrl);
-  console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
+  console.log(`SPEC_ROOT | found=${extracted.specFound} | count=${Object.keys(extracted.specs).length}`);
   console.log(`SPEC_TITLE | found=${extracted.specFound}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
+  if (!Object.keys(extracted.specs).length) {
+    console.log(`SPEC_DIAGNOSTIC | hasSpecText=${extracted.hasSpecText} | body=${JSON.stringify(extracted.bodyText)}`);
+  }
 
   const specs = extracted.specs;
   const { error: saveError } = await supabase.from('updated_specifications').upsert({
@@ -145,4 +208,7 @@ async function main() {
   await Actor.exit();
 }
 
-main().catch(async error => { console.error(error); try { await Actor.fail(); } catch {} });
+main().catch(async error => {
+  console.error(error);
+  try { await Actor.fail(); } catch {}
+});
