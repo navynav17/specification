@@ -27,8 +27,7 @@ function canonicalKey(key: string) {
 }
 
 function looksLikeRealSpecKey(key: string) {
-  const k = clean(key, 120);
-  return SPEC_LABEL.test(k);
+  return SPEC_LABEL.test(clean(key, 120));
 }
 
 function looksLikeRealSpecValue(value: string) {
@@ -45,8 +44,7 @@ function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
   const rawKey = clean(key, 120);
   const k = canonicalKey(rawKey);
   const v = clean(value, 350);
-  if (!k || BAD_KEY.test(k) || !looksLikeRealSpecValue(v)) return;
-  if (!looksLikeRealSpecKey(k)) return;
+  if (!k || BAD_KEY.test(k) || !looksLikeRealSpecValue(v) || !looksLikeRealSpecKey(k)) return;
   out[k] = out[k] && out[k] !== v ? `${out[k]}; ${v}` : v;
 }
 
@@ -66,22 +64,6 @@ function collectNestedSpecs(root: unknown, out: Record<string, string>) {
   }
 }
 
-function extractPairsFromText(text: string, out: Record<string, string>) {
-  const lines = text.split(/\r?\n/).map(x => clean(x, 350)).filter(Boolean);
-  for (let i = 0; i < lines.length; i++) {
-    const a = lines[i];
-    const m = a.match(/^([^:]{2,100}):\s*(.+)$/);
-    if (m && looksLikeRealSpecKey(m[1])) addSpec(out, m[1], m[2]);
-
-    // Only accept an adjacent value when the label is an explicit spec label.
-    // This prevents pairs like "Brand -> More Kitchen Appliances from AURA" from being stored.
-    if (i + 1 < lines.length && looksLikeRealSpecKey(a) && !a.includes(':')) {
-      const next = lines[i + 1];
-      if (!UI_NOISE.test(next) && next.length <= 200) addSpec(out, a, next);
-    }
-  }
-}
-
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -93,9 +75,11 @@ async function extractProduct(url: string) {
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(3500);
-    for (let i = 0; i < 5; i++) {
+
+    // Scroll through the product page so lazy-loaded specification content is rendered.
+    for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(700);
     }
     await page.waitForTimeout(1500);
 
@@ -110,46 +94,58 @@ async function extractProduct(url: string) {
         if (!seen.has(sig)) { seen.add(sig); rows.push([k, v]); }
       };
 
-      // Prefer structured specification tables and definition lists.
-      for (const el of document.querySelectorAll('tr')) {
-        const cells = Array.from(el.querySelectorAll('th,td')).map(x => clean(x.textContent)).filter(Boolean);
-        if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
-      }
-      for (const el of document.querySelectorAll('dt')) {
-        const dd = el.nextElementSibling;
-        if (dd) add(el.textContent, dd.textContent);
-      }
+      // Daraz places product specifications inside this container.
+      const root = document.querySelector('div.pdp-product-details');
+      if (root) {
+        for (const el of root.querySelectorAll('tr')) {
+          const cells = Array.from(el.querySelectorAll('th,td')).map(x => clean(x.textContent)).filter(Boolean);
+          if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
+        }
 
-      // Restrict generic text-pair extraction to short elements. Long product cards/nav containers
-      // commonly concatenate title, ratings, menus and category links into false "values".
-      const all = Array.from(document.querySelectorAll('li,p,span'));
-      for (const el of all) {
-        const t = clean(el.textContent);
-        if (t.length < 1 || t.length > 180) continue;
-        const m = t.match(/^([^:]{2,100}):\\s*(.{1,160})$/);
-        if (m) add(m[1], m[2]);
+        for (const el of root.querySelectorAll('dt')) {
+          const dd = el.nextElementSibling;
+          if (dd) add(el.textContent, dd.textContent);
+        }
+
+        for (const el of Array.from(root.querySelectorAll('li,p,span,div'))) {
+          const t = clean(el.textContent);
+          if (t.length < 1 || t.length > 220) continue;
+
+          // key:value inside a single element
+          const m = t.match(/^([^:]{2,100}):\\s*(.{1,180})$/);
+          if (m) add(m[1], m[2]);
+
+          // Common Daraz layout: a label element followed by a value element.
+          const direct = el.children.length === 0 ? el : null;
+          if (direct) {
+            const parent = el.parentElement;
+            if (parent && parent.children.length === 2) {
+              const siblings = Array.from(parent.children).map(x => clean(x.textContent));
+              if (siblings.length === 2) add(siblings[0], siblings[1]);
+            }
+          }
+        }
       }
 
       const bodyText = clean(document.body?.innerText || '');
-      const html = document.documentElement?.outerHTML || '';
+      const html = root?.outerHTML || '';
       const scripts = Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n');
-      return { rows, bodyText, html, scripts, url: location.href };
+      return { rows, bodyText, html, scripts, url: location.href, rootFound: !!root, rootText: clean(root?.innerText || '') };
     })()`);
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
-    extractPairsFromText(result.bodyText, specs);
 
+    // Search serialized data only for explicit spec keys.
     const rawSources = `${result.html}\n${result.scripts}`;
-    for (const marker of ['__NEXT_DATA__', 'pageData', 'window.pageData', 'window.__pageData__', 'specifications', 'specification']) {
+    for (const marker of ['specifications', 'specification', 'attributes', 'skuAttributeMap']) {
       let from = 0;
       while (true) {
         const idx = rawSources.indexOf(marker, from);
         if (idx < 0) break;
         const start = rawSources.indexOf('{', idx);
         if (start < 0) break;
-        let depth = 0, inString = false, escaped = false;
-        let foundEnd = -1;
+        let depth = 0, inString = false, escaped = false, foundEnd = -1;
         for (let i = start; i < Math.min(rawSources.length, start + 500000); i++) {
           const ch = rawSources[i];
           if (inString) {
@@ -170,7 +166,14 @@ async function extractProduct(url: string) {
     }
 
     await context.close();
-    return { specs, title: clean(result.bodyText.slice(0, 500), 500), finalUrl: result.url, bodyLength: result.bodyText.length };
+    return {
+      specs,
+      title: clean(result.bodyText.slice(0, 500), 500),
+      finalUrl: result.url,
+      bodyLength: result.bodyText.length,
+      rootFound: result.rootFound,
+      rootText: result.rootText
+    };
   } finally {
     await browser.close();
   }
@@ -187,6 +190,8 @@ async function main() {
   const productId = productIdFromUrl(productUrl);
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
+  console.log(`SPEC_CONTAINER | found=${extracted.rootFound} | chars=${extracted.rootText.length}`);
+  console.log(`SPEC_CONTAINER_TEXT | ${JSON.stringify(extracted.rootText)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl} | bodyChars=${extracted.bodyLength}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
