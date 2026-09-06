@@ -11,6 +11,7 @@ const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-
 
 const BAD_KEY = /^(type|class|id|src|href|style|alt|width|height|role|loading|decoding|itemprop|itemtype|itemscope|crossorigin|aria-|data-|script|css|html|body)$/i;
 const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined)$/i;
+const UI_NOISE = /^(more|from|more .+ from|no ratings?|ratings?|add to wishlist|share|report|quantity|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|emi|flash sale|choice|follow|chat now|message)$/i;
 const CANONICAL: Record<string, string> = {
   brand: 'Brand', 'brand name': 'Brand', model: 'Model', 'model name': 'Model',
   colour: 'Color', color: 'Color', 'color family': 'Color Family',
@@ -18,33 +19,66 @@ const CANONICAL: Record<string, string> = {
   warranty: 'Warranty', 'warranty period': 'Warranty', weight: 'Weight',
   dimension: 'Dimensions', dimensions: 'Dimensions'
 };
-const SPEC_LABEL = /^(brand|brand name|model|model name|series|color|colour|color family|ram|ram memory|memory|storage|storage capacity|rom|display|screen|screen size|resolution|refresh rate|processor|cpu|gpu|graphics|chipset|operating system|os|camera|rear camera|front camera|battery|battery capacity|network|sim|sim type|connectivity|wifi|bluetooth|ports?|usb|hdmi|dimensions?|weight|capacity|power|power consumption|voltage|warranty|warranty period|condition|type|product type|panel|panel type|brightness|response time|printer type|print speed|paper size|lens|sensor|megapixel|zoom|video|refrigerant|energy rating|wash capacity|spin speed|cooling capacity|inverter|tonnage|door type|installation type|material|number of doors|freezer capacity|refrigerator capacity|energy class|compressor type|defrost|cooling system|noise level|annual energy consumption|country of origin|motor type|fuel type|horsepower|screen technology|graphics memory|storage type|operating frequency|power consumption|voltage range|input|output|interface|connector|compatibility|water capacity|load capacity|temperature range)$/i;
-function canonicalKey(key: string) { const k = clean(key, 120).toLowerCase(); return CANONICAL[k] || clean(key, 120); }
+const SPEC_LABEL = /^(brand|brand name|model|model name|series|color|colour|color family|ram|ram memory|memory|storage|storage capacity|rom|display|screen|screen size|resolution|refresh rate|processor|cpu|gpu|graphics|chipset|operating system|os|camera|rear camera|front camera|battery|battery capacity|network|sim|sim type|connectivity|wifi|bluetooth|ports?|usb|hdmi|dimensions?|weight|capacity|power|power consumption|voltage|warranty|warranty period|condition|product type|panel|panel type|brightness|response time|printer type|print speed|paper size|lens|sensor|megapixel|zoom|video|refrigerant|energy rating|wash capacity|spin speed|cooling capacity|inverter|tonnage|door type|installation type|material|number of doors|freezer capacity|refrigerator capacity|energy class|compressor type|defrost|cooling system|noise level|annual energy consumption|country of origin|motor type|fuel type|horsepower|screen technology|graphics memory|storage type|operating frequency|power consumption|voltage range|input|output|interface|connector|compatibility|water capacity|load capacity|temperature range)$/i;
+
+function canonicalKey(key: string) {
+  const k = clean(key, 120).toLowerCase();
+  return CANONICAL[k] || clean(key, 120);
+}
+
+function looksLikeRealSpecKey(key: string) {
+  const k = clean(key, 120);
+  return SPEC_LABEL.test(k);
+}
+
+function looksLikeRealSpecValue(value: string) {
+  const v = clean(value, 350);
+  if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
+  if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
+  if (/\b(react|webpack|next\.js|tailwind|hydration|crossorigin)\b/i.test(v)) return false;
+  if (/^more\s+(kitchen|mobile|computer|electronics|home|appliances|products?)/i.test(v)) return false;
+  if (/\b(no ratings?|add to wishlist|out of stock|in stock)\b/i.test(v)) return false;
+  return true;
+}
+
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const k = canonicalKey(String(key ?? '')); const v = clean(value, 350);
-  if (!k || BAD_KEY.test(k) || !v || BAD_VALUE.test(v)) return;
-  if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return;
-  if (/\b(react|webpack|next\.js|tailwind|hydration|crossorigin)\b/i.test(v)) return;
-  if (v.length > 350 || (!SPEC_LABEL.test(k) && !/^[A-Za-z][A-Za-z0-9 /()&+._-]{1,80}$/.test(k))) return;
+  const rawKey = clean(key, 120);
+  const k = canonicalKey(rawKey);
+  const v = clean(value, 350);
+  if (!k || BAD_KEY.test(k) || !looksLikeRealSpecValue(v)) return;
+  if (!looksLikeRealSpecKey(k)) return;
   out[k] = out[k] && out[k] !== v ? `${out[k]}; ${v}` : v;
 }
+
 function collectNestedSpecs(root: unknown, out: Record<string, string>) {
   if (!root || typeof root !== 'object') return;
-  if (Array.isArray(root)) { for (const x of root) collectNestedSpecs(x, out); return; }
+  if (Array.isArray(root)) {
+    for (const x of root) collectNestedSpecs(x, out);
+    return;
+  }
   for (const [k, v] of Object.entries(root as Record<string, unknown>)) {
     if (BAD_KEY.test(k)) continue;
     if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-      if (SPEC_LABEL.test(clean(k, 120))) addSpec(out, k, v);
-    } else collectNestedSpecs(v, out);
+      if (looksLikeRealSpecKey(k)) addSpec(out, k, v);
+    } else {
+      collectNestedSpecs(v, out);
+    }
   }
 }
+
 function extractPairsFromText(text: string, out: Record<string, string>) {
   const lines = text.split(/\r?\n/).map(x => clean(x, 350)).filter(Boolean);
   for (let i = 0; i < lines.length; i++) {
     const a = lines[i];
     const m = a.match(/^([^:]{2,100}):\s*(.+)$/);
-    if (m) addSpec(out, m[1], m[2]);
-    if (i + 1 < lines.length && SPEC_LABEL.test(a) && !a.includes(':')) addSpec(out, a, lines[i + 1]);
+    if (m && looksLikeRealSpecKey(m[1])) addSpec(out, m[1], m[2]);
+
+    // Only accept an adjacent value when the label is an explicit spec label.
+    // This prevents pairs like "Brand -> More Kitchen Appliances from AURA" from being stored.
+    if (i + 1 < lines.length && looksLikeRealSpecKey(a) && !a.includes(':')) {
+      const next = lines[i + 1];
+      if (!UI_NOISE.test(next) && next.length <= 200) addSpec(out, a, next);
+    }
   }
 }
 
@@ -75,6 +109,8 @@ async function extractProduct(url: string) {
         const sig = k + '\\0' + v;
         if (!seen.has(sig)) { seen.add(sig); rows.push([k, v]); }
       };
+
+      // Prefer structured specification tables and definition lists.
       for (const el of document.querySelectorAll('tr')) {
         const cells = Array.from(el.querySelectorAll('th,td')).map(x => clean(x.textContent)).filter(Boolean);
         if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
@@ -83,13 +119,17 @@ async function extractProduct(url: string) {
         const dd = el.nextElementSibling;
         if (dd) add(el.textContent, dd.textContent);
       }
-      const all = Array.from(document.querySelectorAll('li,div,p,span'));
+
+      // Restrict generic text-pair extraction to short elements. Long product cards/nav containers
+      // commonly concatenate title, ratings, menus and category links into false "values".
+      const all = Array.from(document.querySelectorAll('li,p,span'));
       for (const el of all) {
         const t = clean(el.textContent);
-        if (t.length < 1 || t.length > 450) continue;
-        const m = t.match(/^([^:]{2,100}):\\s*(.{1,350})$/);
+        if (t.length < 1 || t.length > 180) continue;
+        const m = t.match(/^([^:]{2,100}):\\s*(.{1,160})$/);
         if (m) add(m[1], m[2]);
       }
+
       const bodyText = clean(document.body?.innerText || '');
       const html = document.documentElement?.outerHTML || '';
       const scripts = Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n');
@@ -131,7 +171,9 @@ async function extractProduct(url: string) {
 
     await context.close();
     return { specs, title: clean(result.bodyText.slice(0, 500), 500), finalUrl: result.url, bodyLength: result.bodyText.length };
-  } finally { await browser.close(); }
+  } finally {
+    await browser.close();
+  }
 }
 
 async function main() {
@@ -156,18 +198,40 @@ async function main() {
     ? existing.specifications as Record<string, unknown> : {};
 
   if (!Object.keys(extracted.specs).length) {
-    await Actor.pushData({url:productUrl,status:'no_verified_specs',specifications:current});
+    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current });
     console.log('SPEC_DONE | no verified specs');
-    await Actor.exit(); return;
+    await Actor.exit();
+    return;
   }
 
-  const merged: Record<string, unknown> = {...current,...extracted.specs};
-  const payload={title:clean(existing?.title||input.title||extracted.title||'Daraz Product',500),price:Number(existing?.price||0),currency:'NPR',image:existing?.image||null,link:productUrl,reviews:existing?.reviews??null,rating:existing?.rating??null,search_term:'product-url-specification',website:'Daraz Nepal',marketplace_id:MARKETPLACE_ID,external_id:productId,specifications:merged};
-  const {data:saved,error:saveError}=await supabase.from('products').upsert(payload,{onConflict:'marketplace_id,external_id'}).select('id').single();
-  if(saveError) throw saveError;
-  await supabase.from('product_enrichment_queue').upsert({product_id:saved.id,brand:merged.Brand||null,model:merged.Model||null,product_type:merged['Product Type']||null,parse_status:'parsed',reason:'Apify product URL specification actor',specifications:merged,updated_at:new Date().toISOString()},{onConflict:'product_id'});
-  await Actor.pushData({url:productUrl,status:'updated',specifications:merged});
+  const merged: Record<string, unknown> = { ...current, ...extracted.specs };
+  const payload = {
+    title: clean(existing?.title || input.title || extracted.title || 'Daraz Product', 500),
+    price: Number(existing?.price || 0), currency: 'NPR', image: existing?.image || null, link: productUrl,
+    reviews: existing?.reviews ?? null, rating: existing?.rating ?? null, search_term: 'product-url-specification',
+    website: 'Daraz Nepal', marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: merged
+  };
+  const { data: saved, error: saveError } = await supabase.from('products')
+    .upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
+  if (saveError) throw saveError;
+
+  await supabase.from('product_enrichment_queue').upsert({
+    product_id: saved.id,
+    brand: merged.Brand || null,
+    model: merged.Model || null,
+    product_type: merged['Product Type'] || null,
+    parse_status: 'parsed',
+    reason: 'Apify product URL specification actor',
+    specifications: merged,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'product_id' });
+
+  await Actor.pushData({ url: productUrl, status: 'updated', specifications: merged });
   console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
 }
-main().catch(async error=>{console.error(error);try{await Actor.fail();}catch{}});
+
+main().catch(async error => {
+  console.error(error);
+  try { await Actor.fail(); } catch {}
+});
