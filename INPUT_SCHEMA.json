@@ -1,0 +1,16 @@
+{
+  "title": "Daraz Product Specification Extractor",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "productUrl": {
+      "title": "Product URL",
+      "type": "string",
+      "description": "Exact Daraz Nepal product URL to open in a browser and extract specifications from.",
+      "editor": "textfield"
+    }
+  },
+  "required": [
+    "productUrl"
+  ]
+}
