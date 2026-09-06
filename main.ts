@@ -25,11 +25,7 @@ function canonicalKey(key: string) {
   const k = clean(key, 120).toLowerCase();
   return CANONICAL[k] || clean(key, 120);
 }
-
-function looksLikeRealSpecKey(key: string) {
-  return SPEC_LABEL.test(clean(key, 120));
-}
-
+function looksLikeRealSpecKey(key: string) { return SPEC_LABEL.test(clean(key, 120)); }
 function looksLikeRealSpecValue(value: string) {
   const v = clean(value, 350);
   if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
@@ -39,28 +35,20 @@ function looksLikeRealSpecValue(value: string) {
   if (/\b(no ratings?|add to wishlist|out of stock|in stock)\b/i.test(v)) return false;
   return true;
 }
-
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const rawKey = clean(key, 120);
-  const k = canonicalKey(rawKey);
+  const k = canonicalKey(clean(key, 120));
   const v = clean(value, 350);
   if (!k || BAD_KEY.test(k) || !looksLikeRealSpecValue(v) || !looksLikeRealSpecKey(k)) return;
   out[k] = out[k] && out[k] !== v ? `${out[k]}; ${v}` : v;
 }
-
 function collectNestedSpecs(root: unknown, out: Record<string, string>) {
   if (!root || typeof root !== 'object') return;
-  if (Array.isArray(root)) {
-    for (const x of root) collectNestedSpecs(x, out);
-    return;
-  }
+  if (Array.isArray(root)) { for (const x of root) collectNestedSpecs(x, out); return; }
   for (const [k, v] of Object.entries(root as Record<string, unknown>)) {
     if (BAD_KEY.test(k)) continue;
     if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
       if (looksLikeRealSpecKey(k)) addSpec(out, k, v);
-    } else {
-      collectNestedSpecs(v, out);
-    }
+    } else collectNestedSpecs(v, out);
   }
 }
 
@@ -92,55 +80,51 @@ async function extractProduct(url: string) {
         rows.push([k, v]);
       };
 
-      // Find the literal Specifications heading anywhere in the rendered DOM.
-      const candidates = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,strong,b'));
-      const heading = candidates.find(el => normalize(el.textContent) === 'specifications');
-
+      // Scope to Daraz's product-details container first.
+      const root = document.querySelector('div.pdp-product-details');
+      let heading = null;
       let section = null;
-      if (heading) {
-        // Prefer the smallest ancestor that contains the heading and the following
-        // specification content, while avoiding the entire page root.
-        let node = heading;
-        for (let i = 0; i < 5 && node.parentElement; i++) {
-          const parent = node.parentElement;
-          const text = clean(parent.innerText || parent.textContent || '');
-          if (text.length > 20 && text.length < 20000) {
-            section = parent;
-          }
-        }
 
-        // If the heading has a following sibling/container, use that local section.
-        if (heading.parentElement) {
+      if (root) {
+        const candidates = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,strong,b'));
+        heading = candidates.find(el => normalize(el.textContent) === 'specifications') || null;
+
+        if (heading) {
+          // Start from the heading and find the nearest useful section within the root.
+          let node = heading;
+          for (let i = 0; i < 5 && node.parentElement; i++) {
+            const parent = node.parentElement;
+            const text = clean(parent.innerText || parent.textContent || '');
+            if (text.length > 20 && text.length < 20000) section = parent;
+          }
+
+          // Prefer a sibling-based section when the heading is its own block.
           const parent = heading.parentElement;
-          const siblings = Array.from(parent.children);
-          const idx = siblings.indexOf(heading);
-          if (idx >= 0 && idx < siblings.length - 1) {
-            const local = siblings.slice(idx).map(x => clean(x.innerText || x.textContent || '')).filter(Boolean).join('\\n');
-            if (local.length > 20) section = parent;
+          if (parent) {
+            const siblings = Array.from(parent.children);
+            const idx = siblings.indexOf(heading);
+            if (idx >= 0) {
+              const localText = siblings.slice(idx).map(x => clean(x.innerText || x.textContent || '')).filter(Boolean).join('\\n');
+              if (localText.length > 20) section = parent;
+            }
           }
         }
       }
-
-      if (!section && heading) section = heading.parentElement;
 
       if (section) {
         for (const el of section.querySelectorAll('tr')) {
           const cells = Array.from(el.querySelectorAll('th,td')).map(x => clean(x.textContent)).filter(Boolean);
           if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
         }
-
         for (const el of section.querySelectorAll('dt')) {
           const dd = el.nextElementSibling;
           if (dd) add(el.textContent, dd.textContent);
         }
-
         for (const el of Array.from(section.querySelectorAll('li,p,span,div'))) {
           const t = clean(el.textContent);
           if (!t || t.length > 220) continue;
-
           const m = t.match(/^([^:]{2,100}):\\s*(.{1,180})$/);
           if (m) add(m[1], m[2]);
-
           if (el.children.length === 0) {
             const parent = el.parentElement;
             if (parent && parent.children.length === 2) {
@@ -151,13 +135,12 @@ async function extractProduct(url: string) {
         }
       }
 
-      const html = document.documentElement?.outerHTML || '';
-      const scripts = Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n');
       return {
         rows,
-        html,
-        scripts,
+        html: root?.outerHTML || '',
+        scripts: Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n'),
         url: location.href,
+        rootFound: !!root,
         headingFound: !!heading,
         headingText: clean(heading?.textContent || ''),
         sectionText: clean(section?.innerText || section?.textContent || '')
@@ -196,16 +179,8 @@ async function extractProduct(url: string) {
     }
 
     await context.close();
-    return {
-      specs,
-      finalUrl: result.url,
-      headingFound: result.headingFound,
-      headingText: result.headingText,
-      sectionText: result.sectionText
-    };
-  } finally {
-    await browser.close();
-  }
+    return { specs, finalUrl: result.url, rootFound: result.rootFound, headingFound: result.headingFound, headingText: result.headingText, sectionText: result.sectionText };
+  } finally { await browser.close(); }
 }
 
 async function main() {
@@ -219,6 +194,7 @@ async function main() {
   const productId = productIdFromUrl(productUrl);
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
+  console.log(`SPEC_CONTAINER | found=${extracted.rootFound}`);
   console.log(`SPEC_TITLE | found=${extracted.headingFound} | text=${JSON.stringify(extracted.headingText)}`);
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
@@ -234,8 +210,7 @@ async function main() {
   if (!Object.keys(extracted.specs).length) {
     await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current });
     console.log('SPEC_DONE | no verified specs');
-    await Actor.exit();
-    return;
+    await Actor.exit(); return;
   }
 
   const merged: Record<string, unknown> = { ...current, ...extracted.specs };
@@ -245,27 +220,17 @@ async function main() {
     reviews: existing?.reviews ?? null, rating: existing?.rating ?? null, search_term: 'product-url-specification',
     website: 'Daraz Nepal', marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: merged
   };
-  const { data: saved, error: saveError } = await supabase.from('products')
-    .upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
+  const { data: saved, error: saveError } = await supabase.from('products').upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
   if (saveError) throw saveError;
 
   await supabase.from('product_enrichment_queue').upsert({
-    product_id: saved.id,
-    brand: merged.Brand || null,
-    model: merged.Model || null,
-    product_type: merged['Product Type'] || null,
-    parse_status: 'parsed',
-    reason: 'Apify product URL specification actor',
-    specifications: merged,
-    updated_at: new Date().toISOString()
+    product_id: saved.id, brand: merged.Brand || null, model: merged.Model || null,
+    product_type: merged['Product Type'] || null, parse_status: 'parsed',
+    reason: 'Apify product URL specification actor', specifications: merged, updated_at: new Date().toISOString()
   }, { onConflict: 'product_id' });
 
   await Actor.pushData({ url: productUrl, status: 'updated', specifications: merged });
   console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
 }
-
-main().catch(async error => {
-  console.error(error);
-  try { await Actor.fail(); } catch {}
-});
+main().catch(async error => { console.error(error); try { await Actor.fail(); } catch {} });
