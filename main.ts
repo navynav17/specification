@@ -15,11 +15,11 @@ const CANONICAL: Record<string, string> = {
   'warranty period': 'Warranty', weight: 'Weight', dimension: 'Dimensions', dimensions: 'Dimensions'
 };
 
-const ALLOWED_KEYS = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model)$/i;
+const ALLOWED_KEYS = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i;
 const BAD_KEY = /^(class|class name|style|display|position|width|height|top|left|right|bottom|margin|padding|background|font|font-family|font-size|line-height|opacity|visibility|z-index|float|text|overflow|content|skuid|brandid|lzd|selector|tag|node|element|href|src|id|name)$/i;
 const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined|inline-block|block|none|relative|absolute|fixed|visible|hidden|auto|inherit|initial|lzd\/popups|lzd\/age-restriction)$/i;
 const BAD_VALUE_PARTS = /(^|[\s:/_-])(?:lzd|skuId|brand_id|age-restriction|popups|inline-block|javascript)([\s:/_-]|$)/i;
-const UI_NOISE = /\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|more kitchen appliances|quantity|wishlist|share|report)\b/i;
+const UI_NOISE = /\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|more kitchen appliances|quantity|wishlist|share|report|chat now)\b/i;
 
 function canonicalKey(key: string) {
   const k = clean(key, 120).toLowerCase();
@@ -33,6 +33,7 @@ function looksLikeRealPair(key: string, value: string) {
   if (!ALLOWED_KEYS.test(k)) return false;
   if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
   if (UI_NOISE.test(v)) return false;
+  if (/^(?:lzd|skuId|brand_id|age-restriction|popups)\b/i.test(v)) return false;
   return true;
 }
 
@@ -55,14 +56,15 @@ async function extractProduct(url: string) {
     const page = await context.newPage();
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(5500);
+    await page.waitForTimeout(6000);
 
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 16; i++) {
       await page.mouse.wheel(0, 1000);
       await page.waitForTimeout(450);
     }
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(3000);
 
+    // Trigger any lazy sections and expand the specification section when possible.
     try {
       const labels = page.getByText('Specifications', { exact: true });
       const count = await labels.count();
@@ -70,7 +72,7 @@ async function extractProduct(url: string) {
         try {
           await labels.nth(i).scrollIntoViewIfNeeded();
           await labels.nth(i).click({ timeout: 2000 });
-          await page.waitForTimeout(1200);
+          await page.waitForTimeout(1500);
         } catch {}
       }
     } catch {}
@@ -84,11 +86,10 @@ async function extractProduct(url: string) {
         if (!k || !v) return;
         const sig = k + '\\u0000' + v;
         if (seen.has(sig)) return;
-        seen.add(sig);
-        rows.push([k, v]);
+        seen.add(sig); rows.push([k, v]);
       };
 
-      // 1) Preferred Daraz specification component.
+      // 1) Preferred current Daraz specification component.
       for (const root of Array.from(document.querySelectorAll('.pdp-mod-specification'))) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
@@ -98,30 +99,29 @@ async function extractProduct(url: string) {
         }
       }
 
-      // 2) Only inspect rows directly associated with a real Specifications heading.
+      // 2) Known Daraz-style key/value tables, restricted to containers whose heading is Specifications.
       const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,p,div,span'))
         .filter(el => clean(el.textContent).toLowerCase() === 'specifications');
       for (const heading of headings.slice(0, 8)) {
         let parent = heading.parentElement;
-        for (let depth = 0; depth < 5 && parent; depth++, parent = parent.parentElement) {
+        for (let depth = 0; depth < 6 && parent; depth++, parent = parent.parentElement) {
           for (const tr of parent.querySelectorAll('tr')) {
             const cells = Array.from(tr.querySelectorAll('th,td')).map(c => clean(c.textContent)).filter(Boolean);
             if (cells.length === 2) push(cells[0], cells[1]);
           }
           for (const item of parent.querySelectorAll('li')) {
-            const spans = Array.from(item.querySelectorAll(':scope > span, :scope > div'))
-              .map(x => clean(x.textContent)).filter(Boolean);
-            if (spans.length === 2) push(spans[0], spans[1]);
+            const direct = Array.from(item.children).map(x => clean(x.textContent)).filter(Boolean);
+            if (direct.length === 2) push(direct[0], direct[1]);
           }
         }
       }
 
-      // 3) Embedded JSON fallback, strictly limited to known specification keys.
-      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model)$/i;
+      // 3) Product specification data embedded in page scripts.
+      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i;
       for (const script of Array.from(document.scripts)) {
         const text = script.textContent || '';
-        if (!/specification|specifications|keyValue/i.test(text)) continue;
-        const pairs = text.matchAll(/(?:\"|')([^\"']{2,80})(?:\"|')\\s*[:=]\\s*(?:\"|')([^\"']{1,300})(?:\"|')/g);
+        if (!/specification|specifications|keyValue|specs/i.test(text)) continue;
+        const pairs = text.matchAll(/(?:\\\"|')([^\\\"']{2,100})(?:\\\"|')\\s*[:=]\\s*(?:\\\"|')([^\\\"']{1,350})(?:\\\"|')/g);
         for (const m of pairs) {
           const k = clean(m[1]);
           const v = clean(m[2]);
@@ -129,14 +129,22 @@ async function extractProduct(url: string) {
         }
       }
 
-      return { rows, title: clean(document.title || ''), url: location.href };
+      return {
+        rows,
+        title: clean(document.title || ''),
+        bodyText: clean(document.body?.innerText || '').slice(0, 16000),
+        url: location.href
+      };
     })()`);
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
+    // Require at least one meaningful specification value. Do not treat Daraz internals as success.
+    const cleanedSpecs = Object.fromEntries(Object.entries(specs).filter(([k, v]) => looksLikeRealPair(k, v)));
+
     await context.close();
-    return { specs, finalUrl: result.url, title: result.title };
+    return { specs: cleanedSpecs, finalUrl: result.url, title: result.title, bodyText: result.bodyText };
   } finally {
     await browser.close();
   }
@@ -148,66 +156,91 @@ async function main() {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-  const { data: pending, error: queueError } = await supabase
-    .from('products')
-    .select('id,title,price,image,link,reviews,rating,created_at')
-    .not('link', 'is', null)
-    .like('link', '%daraz.com.np%')
-    .not('link', 'like', '%/categories/%')
-    .order('created_at', { ascending: true })
-    .limit(200);
-  if (queueError) throw queueError;
+  // Process all pending Daraz products in this run.
+  const pageSize = 200;
+  let offset = 0;
+  let totalSelected = 0;
+  let totalProcessed = 0;
+  let totalSaved = 0;
+  let totalNoSpecs = 0;
 
-  const candidates = (pending || []).filter((p: any) => {
-    try {
-      const u = new URL(p.link);
-      return (u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`) && /\/products\//i.test(u.pathname) && /-i\d+\.html/i.test(u.pathname);
-    } catch { return false; }
-  });
+  while (true) {
+    const { data: pending, error: queueError } = await supabase
+      .from('products')
+      .select('id,title,price,image,link,reviews,rating,created_at')
+      .not('link', 'is', null)
+      .like('link', '%daraz.com.np%')
+      .not('link', 'like', '%/categories/%')
+      .order('created_at', { ascending: true })
+      .range(offset, offset + pageSize - 1);
+    if (queueError) throw queueError;
+    if (!pending?.length) break;
 
-  let selected: any = null;
-  for (const candidate of candidates) {
-    const { data: already } = await supabase
-      .from('updated_specifications')
-      .select('id')
-      .eq('product_id', candidate.id)
-      .limit(1)
-      .maybeSingle();
-    if (!already) { selected = candidate; break; }
+    const candidates = pending.filter((p: any) => {
+      try {
+        const u = new URL(p.link);
+        return (u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`) && /\/products\//i.test(u.pathname) && /-i\d+\.html/i.test(u.pathname);
+      } catch { return false; }
+    });
+
+    if (!candidates.length) {
+      offset += pageSize;
+      continue;
+    }
+
+    for (const selected of candidates) {
+      const { data: already } = await supabase
+        .from('updated_specifications')
+        .select('id')
+        .eq('product_id', selected.id)
+        .limit(1)
+        .maybeSingle();
+      if (already) continue;
+
+      totalSelected++;
+      const productUrl = clean(selected.link, 2500);
+      console.log(`SPEC_START | daraz_url=${productUrl} | product_id=${selected.id}`);
+
+      try {
+        const extracted = await extractProduct(productUrl);
+        console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
+        console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
+
+        totalProcessed++;
+        const specs = extracted.specs;
+
+        if (Object.keys(specs).length === 0) {
+          totalNoSpecs++;
+          await Actor.pushData({ url: productUrl, status: 'no_verified_specs', productId: selected.id, specifications: {} });
+          console.log(`SPEC_SKIP | product_id=${selected.id} | reason=no_verified_specs`);
+          continue;
+        }
+
+        const { error: saveError } = await supabase.from('updated_specifications').upsert({
+          product_id: selected.id,
+          product_url: productUrl,
+          specifications: specs,
+          source: 'apify-specification',
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'product_url' });
+        if (saveError) throw saveError;
+
+        totalSaved++;
+        await Actor.pushData({ url: productUrl, status: 'updated', productId: selected.id, specifications: specs });
+        console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications | product_id=${selected.id}`);
+      } catch (error) {
+        totalProcessed++;
+        console.error(`SPEC_ERROR | product_id=${selected.id} | error=${String(error)}`);
+        await Actor.pushData({ url: productUrl, status: 'error', productId: selected.id, error: String(error) });
+      }
+    }
+
+    offset += pageSize;
+    if (pending.length < pageSize) break;
   }
 
-  if (!selected) {
-    await Actor.pushData({ status: 'no_pending_daraz_products' });
-    await Actor.exit();
-    return;
-  }
-
-  const productUrl = clean(selected.link, 2500);
-  console.log(`SPEC_START | daraz_url=${productUrl} | product_id=${selected.id}`);
-
-  const extracted = await extractProduct(productUrl);
-  console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
-  console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
-
-  const specs = extracted.specs;
-  if (Object.keys(specs).length === 0) {
-    console.log('SPEC_DONE | skipped empty/invalid extraction');
-    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', productId: selected.id, specifications: {} });
-    await Actor.exit();
-    return;
-  }
-
-  const { error: saveError } = await supabase.from('updated_specifications').upsert({
-    product_id: selected.id,
-    product_url: productUrl,
-    specifications: specs,
-    source: 'apify-specification',
-    updated_at: new Date().toISOString()
-  }, { onConflict: 'product_url' });
-  if (saveError) throw saveError;
-
-  await Actor.pushData({ url: productUrl, status: 'updated', productId: selected.id, specifications: specs });
-  console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications`);
+  await Actor.pushData({ status: 'completed', mode: 'all_pending_daraz', selected: totalSelected, processed: totalProcessed, saved: totalSaved, noVerifiedSpecs: totalNoSpecs });
+  console.log(`SPEC_BATCH_DONE | selected=${totalSelected} | processed=${totalProcessed} | saved=${totalSaved} | no_verified_specs=${totalNoSpecs}`);
   await Actor.exit();
 }
 
