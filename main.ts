@@ -15,10 +15,11 @@ const CANONICAL: Record<string, string> = {
   'warranty period': 'Warranty', weight: 'Weight', dimension: 'Dimensions', dimensions: 'Dimensions'
 };
 
-const ALLOWED_KEYS = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type)$/i;
-const BAD_KEY = /^(class|class name|style|display|position|width|height|top|left|right|bottom|margin|padding|background|font|font-family|font-size|line-height|opacity|visibility|z-index|float|text|overflow|content|skuid|brandid|lzd|selector|tag|node|element)$/i;
-const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined|inline-block|block|none|relative|absolute|fixed|visible|hidden|auto|inherit|initial|lzd\/popups)$/i;
-const UI_NOISE = /\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|more kitchen appliances|quantity)\b/i;
+const ALLOWED_KEYS = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model)$/i;
+const BAD_KEY = /^(class|class name|style|display|position|width|height|top|left|right|bottom|margin|padding|background|font|font-family|font-size|line-height|opacity|visibility|z-index|float|text|overflow|content|skuid|brandid|lzd|selector|tag|node|element|href|src|id|name)$/i;
+const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined|inline-block|block|none|relative|absolute|fixed|visible|hidden|auto|inherit|initial|lzd\/popups|lzd\/age-restriction)$/i;
+const BAD_VALUE_PARTS = /(^|[\s:/_-])(?:lzd|skuId|brand_id|age-restriction|popups|inline-block|javascript)([\s:/_-]|$)/i;
+const UI_NOISE = /\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|more kitchen appliances|quantity|wishlist|share|report)\b/i;
 
 function canonicalKey(key: string) {
   const k = clean(key, 120).toLowerCase();
@@ -28,7 +29,7 @@ function canonicalKey(key: string) {
 function looksLikeRealPair(key: string, value: string) {
   const k = clean(key, 120);
   const v = clean(value, 350);
-  if (!k || !v || BAD_KEY.test(k) || BAD_VALUE.test(v)) return false;
+  if (!k || !v || BAD_KEY.test(k) || BAD_VALUE.test(v) || BAD_VALUE_PARTS.test(v)) return false;
   if (!ALLOWED_KEYS.test(k)) return false;
   if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
   if (UI_NOISE.test(v)) return false;
@@ -52,17 +53,16 @@ async function extractProduct(url: string) {
       locale: 'en-US'
     });
     const page = await context.newPage();
+
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(5500);
 
-    // Trigger lazy loading throughout the page.
     for (let i = 0; i < 14; i++) {
       await page.mouse.wheel(0, 1000);
       await page.waitForTimeout(450);
     }
     await page.waitForTimeout(2500);
 
-    // Expand Specifications where the page exposes it as a clickable control.
     try {
       const labels = page.getByText('Specifications', { exact: true });
       const count = await labels.count();
@@ -88,7 +88,7 @@ async function extractProduct(url: string) {
         rows.push([k, v]);
       };
 
-      // 1) Current Daraz specification component.
+      // 1) Preferred Daraz specification component.
       for (const root of Array.from(document.querySelectorAll('.pdp-mod-specification'))) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
@@ -98,25 +98,26 @@ async function extractProduct(url: string) {
         }
       }
 
-      // 2) Alternate specification tables near a real Specifications heading.
-      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p'))
+      // 2) Only inspect rows directly associated with a real Specifications heading.
+      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,p,div,span'))
         .filter(el => clean(el.textContent).toLowerCase() === 'specifications');
       for (const heading of headings.slice(0, 8)) {
         let parent = heading.parentElement;
-        for (let depth = 0; depth < 6 && parent; depth++, parent = parent.parentElement) {
+        for (let depth = 0; depth < 5 && parent; depth++, parent = parent.parentElement) {
           for (const tr of parent.querySelectorAll('tr')) {
             const cells = Array.from(tr.querySelectorAll('th,td')).map(c => clean(c.textContent)).filter(Boolean);
             if (cells.length === 2) push(cells[0], cells[1]);
           }
-          for (const li of parent.querySelectorAll('li')) {
-            const texts = Array.from(li.querySelectorAll('span,div')).map(x => clean(x.textContent)).filter(Boolean);
-            if (texts.length === 2) push(texts[0], texts[1]);
+          for (const item of parent.querySelectorAll('li')) {
+            const spans = Array.from(item.querySelectorAll(':scope > span, :scope > div'))
+              .map(x => clean(x.textContent)).filter(Boolean);
+            if (spans.length === 2) push(spans[0], spans[1]);
           }
         }
       }
 
-      // 3) Strict embedded-JSON fallback. Only known specification keys are admitted.
-      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type)$/i;
+      // 3) Embedded JSON fallback, strictly limited to known specification keys.
+      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|waterproof|mounting type|compatible brand|compatible model)$/i;
       for (const script of Array.from(document.scripts)) {
         const text = script.textContent || '';
         if (!/specification|specifications|keyValue/i.test(text)) continue;
