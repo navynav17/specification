@@ -11,34 +11,56 @@ const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-
 
 const BAD_KEY = /^(type|class|id|src|href|style|alt|width|height|role|loading|decoding|itemprop|itemtype|itemscope|crossorigin|aria-|data-|script|css|html|body)$/i;
 const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined)$/i;
+const UI_NOISE = /^(more|from|more .+ from|no ratings?|ratings?|add to wishlist|share|report|quantity|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|emi|flash sale|choice|follow|chat now|message)$/i;
 const CANONICAL: Record<string, string> = {
   brand: 'Brand', 'brand name': 'Brand', model: 'Model', 'model name': 'Model',
-  colour: 'Color', color: 'Color', 'color family': 'Color Family', capacity: 'Capacity',
-  type: 'Product Type', 'product type': 'Product Type', warranty: 'Warranty',
-  'warranty period': 'Warranty', weight: 'Weight', dimension: 'Dimensions', dimensions: 'Dimensions'
+  colour: 'Color', color: 'Color', 'color family': 'Color Family',
+  capacity: 'Capacity', type: 'Product Type', 'product type': 'Product Type',
+  warranty: 'Warranty', 'warranty period': 'Warranty', weight: 'Weight',
+  dimension: 'Dimensions', dimensions: 'Dimensions'
 };
+const SPEC_LABEL = /^(brand|brand name|model|model name|series|color|colour|color family|ram|ram memory|memory|storage|storage capacity|rom|display|screen|screen size|resolution|refresh rate|processor|cpu|gpu|graphics|chipset|operating system|os|camera|rear camera|front camera|battery|battery capacity|network|sim|sim type|connectivity|wifi|bluetooth|ports?|usb|hdmi|dimensions?|weight|capacity|power|power consumption|voltage|warranty|warranty period|condition|product type|panel|panel type|brightness|response time|printer type|print speed|paper size|lens|sensor|megapixel|zoom|video|refrigerant|energy rating|wash capacity|spin speed|cooling capacity|inverter|tonnage|door type|installation type|material|number of doors|freezer capacity|refrigerator capacity|energy class|compressor type|defrost|cooling system|noise level|annual energy consumption|country of origin|motor type|fuel type|horsepower|screen technology|graphics memory|storage type|operating frequency|voltage range|input|output|interface|connector|compatibility|water capacity|load capacity|temperature range)$/i;
 
 function canonicalKey(key: string) {
   const k = clean(key, 120).toLowerCase();
   return CANONICAL[k] || clean(key, 120);
 }
 
-function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const k = canonicalKey(String(key ?? ''));
+function looksLikeRealSpecKey(key: string) {
+  return SPEC_LABEL.test(clean(key, 120));
+}
+
+function looksLikeRealSpecValue(value: string) {
   const v = clean(value, 350);
-  if (!k || BAD_KEY.test(k) || BAD_VALUE.test(v)) return;
-  if (!v || /^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return;
-  if (/\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|flash sale|choice|follow|chat now|message|more kitchen appliances|more from)\b/i.test(v)) return;
-  out[k] = v;
+  if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
+  if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
+  if (/\b(react|webpack|next\.js|tailwind|hydration|crossorigin)\b/i.test(v)) return false;
+  if (/^more\s+(kitchen|mobile|computer|electronics|home|appliances|products?)/i.test(v)) return false;
+  if (/\b(no ratings?|add to wishlist|out of stock|in stock)\b/i.test(v)) return false;
+  return true;
+}
+
+function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
+  const rawKey = clean(key, 120);
+  const k = canonicalKey(rawKey);
+  const v = clean(value, 350);
+  if (!k || BAD_KEY.test(k) || !looksLikeRealSpecValue(v) || !looksLikeRealSpecKey(k)) return;
+  out[k] = out[k] && out[k] !== v ? `${out[k]}; ${v}` : v;
 }
 
 function collectNestedSpecs(root: unknown, out: Record<string, string>) {
   if (!root || typeof root !== 'object') return;
-  if (Array.isArray(root)) { for (const x of root) collectNestedSpecs(x, out); return; }
+  if (Array.isArray(root)) {
+    for (const x of root) collectNestedSpecs(x, out);
+    return;
+  }
   for (const [k, v] of Object.entries(root as Record<string, unknown>)) {
     if (BAD_KEY.test(k)) continue;
-    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') addSpec(out, k, v);
-    else collectNestedSpecs(v, out);
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      if (looksLikeRealSpecKey(k)) addSpec(out, k, v);
+    } else {
+      collectNestedSpecs(v, out);
+    }
   }
 }
 
@@ -54,7 +76,7 @@ async function extractProduct(url: string) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(3500);
 
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(700);
     }
@@ -62,80 +84,123 @@ async function extractProduct(url: string) {
 
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
-      const headings = Array.from(document.querySelectorAll('div.pdp-product-details *'))
-        .filter(el => clean(el.textContent) === 'Specifications');
-
-      const heading = headings.find(el => {
-        const cls = String(el.className || '');
-        return cls.includes('title') || cls.includes('spec') || /^(H[1-6]|DIV|SPAN|P)$/i.test(el.tagName);
-      }) || headings[0] || null;
-
-      let section = null;
-      if (heading) {
-        let node = heading.parentElement;
-        for (let i = 0; node && i < 5; i++, node = node.parentElement) {
-          const text = clean(node.textContent);
-          if (text.length > 25 && text.length < 20000 && node.querySelectorAll('tr,dt,dd,li').length > 0) {
-            section = node;
-            break;
-          }
-        }
-        if (!section) section = heading.parentElement;
-      }
-
+      const normalize = (v) => clean(v).toLowerCase();
       const rows = [];
-      const seen = new Set();
       const add = (k, v) => {
         k = clean(k); v = clean(v);
         if (!k || !v) return;
-        const sig = k + '\\0' + v;
-        if (!seen.has(sig)) { seen.add(sig); rows.push([k, v]); }
+        rows.push([k, v]);
       };
+
+      // Find the literal Specifications heading anywhere in the rendered DOM.
+      const candidates = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,strong,b'));
+      const heading = candidates.find(el => normalize(el.textContent) === 'specifications');
+
+      let section = null;
+      if (heading) {
+        // Prefer the smallest ancestor that contains the heading and the following
+        // specification content, while avoiding the entire page root.
+        let node = heading;
+        for (let i = 0; i < 5 && node.parentElement; i++) {
+          const parent = node.parentElement;
+          const text = clean(parent.innerText || parent.textContent || '');
+          if (text.length > 20 && text.length < 20000) {
+            section = parent;
+          }
+        }
+
+        // If the heading has a following sibling/container, use that local section.
+        if (heading.parentElement) {
+          const parent = heading.parentElement;
+          const siblings = Array.from(parent.children);
+          const idx = siblings.indexOf(heading);
+          if (idx >= 0 && idx < siblings.length - 1) {
+            const local = siblings.slice(idx).map(x => clean(x.innerText || x.textContent || '')).filter(Boolean).join('\\n');
+            if (local.length > 20) section = parent;
+          }
+        }
+      }
+
+      if (!section && heading) section = heading.parentElement;
 
       if (section) {
         for (const el of section.querySelectorAll('tr')) {
           const cells = Array.from(el.querySelectorAll('th,td')).map(x => clean(x.textContent)).filter(Boolean);
           if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
         }
+
         for (const el of section.querySelectorAll('dt')) {
           const dd = el.nextElementSibling;
           if (dd) add(el.textContent, dd.textContent);
         }
 
-        const leafs = Array.from(section.querySelectorAll('li,p,span,div')).filter(el => el.children.length === 0);
-        for (const el of leafs) {
+        for (const el of Array.from(section.querySelectorAll('li,p,span,div'))) {
           const t = clean(el.textContent);
-          if (!t || t.length > 300) continue;
-          const m = t.match(/^([^:]{2,100}):\\s*(.{1,220})$/);
-          if (m) add(m[1], m[2]);
-        }
+          if (!t || t.length > 220) continue;
 
-        // Common Daraz specification structure: consecutive text nodes/elements inside a row.
-        for (const row of Array.from(section.querySelectorAll('div'))) {
-          const children = Array.from(row.children).filter(x => clean(x.textContent));
-          if (children.length === 2) {
-            const a = clean(children[0].textContent);
-            const b = clean(children[1].textContent);
-            if (a && b && a.length <= 100 && b.length <= 300) add(a, b);
+          const m = t.match(/^([^:]{2,100}):\\s*(.{1,180})$/);
+          if (m) add(m[1], m[2]);
+
+          if (el.children.length === 0) {
+            const parent = el.parentElement;
+            if (parent && parent.children.length === 2) {
+              const siblings = Array.from(parent.children).map(x => clean(x.textContent));
+              if (siblings.length === 2) add(siblings[0], siblings[1]);
+            }
           }
         }
       }
 
-      const root = document.querySelector('div.pdp-product-details');
-      const rootText = clean(root?.innerText || '');
-      const sectionText = clean(section?.innerText || '');
-      return { rows, url: location.href, headingFound: !!heading, rootFound: !!root, rootText, sectionText };
+      const html = document.documentElement?.outerHTML || '';
+      const scripts = Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n');
+      return {
+        rows,
+        html,
+        scripts,
+        url: location.href,
+        headingFound: !!heading,
+        headingText: clean(heading?.textContent || ''),
+        sectionText: clean(section?.innerText || section?.textContent || '')
+      };
     })()`);
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
+    const rawSources = `${result.html}\n${result.scripts}`;
+    for (const marker of ['specifications', 'specification', 'attributes', 'skuAttributeMap']) {
+      let from = 0;
+      while (true) {
+        const idx = rawSources.indexOf(marker, from);
+        if (idx < 0) break;
+        const start = rawSources.indexOf('{', idx);
+        if (start < 0) break;
+        let depth = 0, inString = false, escaped = false, foundEnd = -1;
+        for (let i = start; i < Math.min(rawSources.length, start + 500000); i++) {
+          const ch = rawSources[i];
+          if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+          }
+          if (ch === '"') inString = true;
+          else if (ch === '{') depth++;
+          else if (ch === '}' && --depth === 0) { foundEnd = i; break; }
+        }
+        if (foundEnd > 0) {
+          try { collectNestedSpecs(JSON.parse(rawSources.slice(start, foundEnd + 1)), specs); } catch {}
+        }
+        from = idx + marker.length;
+      }
+    }
+
+    await context.close();
     return {
       specs,
       finalUrl: result.url,
-      rootFound: result.rootFound,
       headingFound: result.headingFound,
-      rootText: result.rootText,
+      headingText: result.headingText,
       sectionText: result.sectionText
     };
   } finally {
@@ -152,11 +217,9 @@ async function main() {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
   const productId = productIdFromUrl(productUrl);
-
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
-  console.log(`SPEC_ROOT | found=${extracted.rootFound} | chars=${extracted.rootText.length}`);
-  console.log(`SPEC_TITLE | found=${extracted.headingFound}`);
+  console.log(`SPEC_TITLE | found=${extracted.headingFound} | text=${JSON.stringify(extracted.headingText)}`);
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
@@ -165,7 +228,6 @@ async function main() {
     .select('id,title,price,image,link,reviews,rating,specifications')
     .eq('link', productUrl).limit(1).maybeSingle();
   if (existingError) throw existingError;
-
   const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
     ? existing.specifications as Record<string, unknown> : {};
 
