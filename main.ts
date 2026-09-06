@@ -63,49 +63,30 @@ async function extractProduct(url: string) {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
       const norm = (v) => clean(v).toLowerCase();
       const rows = [];
-      const add = (k, v) => {
-        k = clean(k); v = clean(v);
-        if (!k || !v) return;
-        rows.push([k, v]);
-      };
+      const add = (k, v) => { k = clean(k); v = clean(v); if (k && v) rows.push([k, v]); };
+      const all = Array.from(document.querySelectorAll('*'));
 
-      // Known Daraz scope, then locate the Specifications label inside it.
-      const root = document.querySelector('div.pdp-product-details');
-      let heading = null;
+      const exactSpecs = all.filter(el => norm(el.textContent) === 'specifications');
+      const fuzzySpecs = all.filter(el => norm(el.textContent).startsWith('specifications') && clean(el.textContent).length < 1000);
+      const classMatches = all.filter(el => typeof el.className === 'string' && /pdp-product-details/i.test(String(el.className)));
+
+      // Collect likely specification section candidates from the actual rendered DOM.
       let section = null;
-      let headingParentHtml = '';
-      let headingParentText = '';
-      let followingHtml = '';
-
-      if (root) {
-        const candidates = Array.from(root.querySelectorAll('*'));
-        heading = candidates.find(el => norm(el.textContent) === 'specifications') || null;
-
-        if (heading) {
-          const parent = heading.parentElement;
-          if (parent) {
-            headingParentHtml = parent.outerHTML.slice(0, 20000);
-            headingParentText = clean(parent.innerText || parent.textContent || '');
-            const children = Array.from(parent.children);
-            const idx = children.indexOf(heading);
-            if (idx >= 0) {
-              followingHtml = children.slice(idx + 1).map(x => x.outerHTML).join('\\n').slice(0, 30000);
-            }
+      let heading = null;
+      const candidateList = [...exactSpecs, ...fuzzySpecs].sort((a, b) => a.children.length - b.children.length);
+      if (candidateList.length) {
+        heading = candidateList[0];
+        let node = heading;
+        for (let i = 0; i < 8 && node.parentElement; i++) {
+          const p = node.parentElement;
+          const txt = clean(p.innerText || p.textContent || '');
+          if (txt.toLowerCase().includes('specifications') && txt.length > clean(heading.textContent).length && txt.length < 30000) {
+            section = p;
           }
-
-          // Instead of guessing a large ancestor, choose the first ancestor that has
-          // structured rows or spec-like two-column children.
-          let node = heading;
-          for (let i = 0; i < 6 && node.parentElement; i++) {
-            const p = node.parentElement;
-            const rowCount = p.querySelectorAll('tr').length;
-            const detailPairs = Array.from(p.children).filter(x => x.children.length === 2).length;
-            if (rowCount > 0 || detailPairs > 0) {
-              section = p;
-              break;
-            }
+          if (p.querySelectorAll('table,tr,li,dt').length > 0 && txt.length < 15000) {
+            section = p;
+            break;
           }
-          if (!section) section = heading.parentElement;
         }
       }
 
@@ -128,34 +109,19 @@ async function extractProduct(url: string) {
       return {
         rows,
         url: location.href,
-        rootFound: !!root,
-        headingFound: !!heading,
-        headingText: clean(heading?.textContent || ''),
-        sectionText: clean(section?.innerText || section?.textContent || ''),
-        headingParentText,
-        headingParentHtml,
-        followingHtml
+        classMatches: classMatches.slice(0, 20).map(el => ({ tag: el.tagName, cls: String(el.className), text: clean(el.innerText || el.textContent || '').slice(0, 1000) })),
+        exactSpecs: exactSpecs.slice(0, 20).map(el => ({ tag: el.tagName, cls: String(el.className || ''), text: clean(el.textContent).slice(0, 500), html: String(el.outerHTML).slice(0, 3000) })),
+        fuzzySpecs: fuzzySpecs.slice(0, 20).map(el => ({ tag: el.tagName, cls: String(el.className || ''), text: clean(el.textContent).slice(0, 500), html: String(el.outerHTML).slice(0, 3000) })),
+        sectionFound: !!section,
+        sectionText: clean(section?.innerText || section?.textContent || '').slice(0, 15000)
       };
     })()`);
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
-
     await context.close();
-    return {
-      specs,
-      finalUrl: result.url,
-      rootFound: result.rootFound,
-      headingFound: result.headingFound,
-      headingText: result.headingText,
-      sectionText: result.sectionText,
-      headingParentText: result.headingParentText,
-      headingParentHtml: result.headingParentHtml,
-      followingHtml: result.followingHtml
-    };
-  } finally {
-    await browser.close();
-  }
+    return { specs, finalUrl: result.url, ...result };
+  } finally { await browser.close(); }
 }
 
 async function main() {
@@ -164,47 +130,32 @@ async function main() {
   const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
   const productUrl = clean(input.productUrl || input.url || '', 2500);
   if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required');
-
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
   const productId = productIdFromUrl(productUrl);
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
-  console.log(`SPEC_CONTAINER | found=${extracted.rootFound}`);
-  console.log(`SPEC_TITLE | found=${extracted.headingFound} | text=${JSON.stringify(extracted.headingText)}`);
+  console.log(`SPEC_CONTAINER | pdp-product-details matches=${extracted.classMatches.length}`);
+  console.log(`SPEC_CLASS_SAMPLES | ${JSON.stringify(extracted.classMatches)}`);
+  console.log(`SPEC_EXACT_SPECS | ${JSON.stringify(extracted.exactSpecs)}`);
+  console.log(`SPEC_FUZZY_SPECS | ${JSON.stringify(extracted.fuzzySpecs)}`);
+  console.log(`SPEC_SECTION | found=${extracted.sectionFound}`);
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
-  console.log(`SPEC_HEADING_PARENT_TEXT | ${JSON.stringify(extracted.headingParentText)}`);
-  console.log(`SPEC_HEADING_PARENT_HTML | ${extracted.headingParentHtml}`);
-  console.log(`SPEC_FOLLOWING_HTML | ${extracted.followingHtml}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
-  const { data: existing, error: existingError } = await supabase.from('products')
-    .select('id,title,price,image,link,reviews,rating,specifications')
-    .eq('link', productUrl).limit(1).maybeSingle();
+  const { data: existing, error: existingError } = await supabase.from('products').select('id,title,price,image,link,reviews,rating,specifications').eq('link', productUrl).limit(1).maybeSingle();
   if (existingError) throw existingError;
-  const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
-    ? existing.specifications as Record<string, unknown> : {};
-
+  const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications) ? existing.specifications as Record<string, unknown> : {};
   if (!Object.keys(extracted.specs).length) {
-    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current });
+    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current, diagnostic: { classMatches: extracted.classMatches, exactSpecs: extracted.exactSpecs, fuzzySpecs: extracted.fuzzySpecs, sectionText: extracted.sectionText } });
     console.log('SPEC_DONE | no verified specs');
     await Actor.exit(); return;
   }
-
   const merged: Record<string, unknown> = { ...current, ...extracted.specs };
-  const payload = {
-    title: clean(existing?.title || input.title || 'Daraz Product', 500),
-    price: Number(existing?.price || 0), currency: 'NPR', image: existing?.image || null, link: productUrl,
-    reviews: existing?.reviews ?? null, rating: existing?.rating ?? null, search_term: 'product-url-specification',
-    website: 'Daraz Nepal', marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: merged
-  };
+  const payload = { title: clean(existing?.title || input.title || 'Daraz Product', 500), price: Number(existing?.price || 0), currency: 'NPR', image: existing?.image || null, link: productUrl, reviews: existing?.reviews ?? null, rating: existing?.rating ?? null, search_term: 'product-url-specification', website: 'Daraz Nepal', marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: merged };
   const { data: saved, error: saveError } = await supabase.from('products').upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
   if (saveError) throw saveError;
-  await supabase.from('product_enrichment_queue').upsert({
-    product_id: saved.id, brand: merged.Brand || null, model: merged.Model || null,
-    product_type: merged['Product Type'] || null, parse_status: 'parsed',
-    reason: 'Apify product URL specification actor', specifications: merged, updated_at: new Date().toISOString()
-  }, { onConflict: 'product_id' });
+  await supabase.from('product_enrichment_queue').upsert({ product_id: saved.id, brand: merged.Brand || null, model: merged.Model || null, product_type: merged['Product Type'] || null, parse_status: 'parsed', reason: 'Apify product URL specification actor', specifications: merged, updated_at: new Date().toISOString() }, { onConflict: 'product_id' });
   await Actor.pushData({ url: productUrl, status: 'updated', specifications: merged });
   console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
