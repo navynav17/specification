@@ -4,7 +4,6 @@ import { chromium } from 'playwright';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://foupthwcnnskqlzhoyep.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const MARKETPLACE_ID = process.env.MARKETPLACE_ID || '6a4f8822-e1bc-4e8b-be61-4d1a400f3c13';
 
 const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
@@ -52,7 +51,7 @@ async function extractProduct(url: string) {
         }
       }
       const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title')).some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
-      return { rows, rootCount: roots.length, specFound: !!specRoot, sectionText: clean(specRoot?.innerText || '').slice(0, 15000), html: specRoot?.outerHTML?.slice(0, 30000) || '', url: location.href };
+      return { rows, rootCount: roots.length, specFound: !!specRoot, sectionText: clean(specRoot?.innerText || '').slice(0, 15000), url: location.href };
     })()`);
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
@@ -64,10 +63,36 @@ async function extractProduct(url: string) {
 async function main() {
   await Actor.init();
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
-  const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
-  const productUrl = clean(input.productUrl || input.url || '', 2500);
-  if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required');
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+
+  const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
+  let productUrl = clean(input.productUrl || input.url || '', 2500);
+  let existing: any = null;
+
+  if (!/^https?:\/\//i.test(productUrl)) {
+    const { data, error } = await supabase
+      .from('products')
+      .select('id,title,price,image,link,reviews,rating')
+      .not('link', 'is', null)
+      .order('updated_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    existing = data;
+    productUrl = clean(data?.link || '', 2500);
+  } else {
+    const { data, error } = await supabase
+      .from('products')
+      .select('id,title,price,image,link,reviews,rating')
+      .eq('link', productUrl)
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    existing = data;
+  }
+
+  if (!/^https?:\/\//i.test(productUrl)) throw new Error('No product URL found in Supabase products.link');
+
   const productId = productIdFromUrl(productUrl);
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
@@ -76,15 +101,6 @@ async function main() {
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
-
-  const { data: existing, error: existingError } = await supabase.from('products').select('id,title,price,image,link,reviews,rating').eq('link', productUrl).limit(1).maybeSingle();
-  if (existingError) throw existingError;
-
-  if (!Object.keys(extracted.specs).length) {
-    await supabase.from('updated_specifications').upsert({ product_id: existing?.id || null, product_url: productUrl, specifications: {}, source: 'apify-specification', updated_at: new Date().toISOString() }, { onConflict: 'product_url' });
-    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: {} });
-    await Actor.exit(); return;
-  }
 
   const specs = extracted.specs;
   const { error: saveError } = await supabase.from('updated_specifications').upsert({
@@ -96,7 +112,7 @@ async function main() {
   }, { onConflict: 'product_url' });
   if (saveError) throw saveError;
 
-  await Actor.pushData({ url: productUrl, status: 'updated', productId: existing?.id || null, specifications: specs });
+  await Actor.pushData({ url: productUrl, productId: existing?.id || null, status: Object.keys(specs).length ? 'updated' : 'no_verified_specs', specifications: specs });
   console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications`);
   await Actor.exit();
 }
