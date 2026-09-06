@@ -4,6 +4,7 @@ import { chromium } from 'playwright';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://foupthwcnnskqlzhoyep.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const DARAZ_HOST = 'daraz.com.np';
 
 const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
@@ -26,13 +27,18 @@ function looksLikeRealValue(value: string) {
 }
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
   const k = canonicalKey(clean(key, 120)); const v = clean(value, 350);
-  if (!k || !looksLikeRealValue(v)) return; out[k] = v;
+  if (!k || !looksLikeRealValue(v)) return;
+  out[k] = v;
 }
 
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
   try {
-    const context = await browser.newContext({ viewport: { width: 1440, height: 1200 }, userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36', locale: 'en-US' });
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1200 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+      locale: 'en-US'
+    });
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(3500);
@@ -51,7 +57,7 @@ async function extractProduct(url: string) {
         }
       }
       const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title')).some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
-      return { rows, rootCount: roots.length, specFound: !!specRoot, sectionText: clean(specRoot?.innerText || '').slice(0, 15000), url: location.href };
+      return { rows, rootCount: roots.length, specFound: !!specRoot, sectionText: clean(specRoot?.innerText || '').slice(0, 15000), html: specRoot?.outerHTML?.slice(0, 30000) || '', url: location.href };
     })()`);
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
@@ -63,48 +69,64 @@ async function extractProduct(url: string) {
 async function main() {
   await Actor.init();
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
+
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-  const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
-  let productUrl = clean(input.productUrl || input.url || '', 2500);
-  let existing: any = null;
+  // Only select Daraz Nepal product URLs that have not yet been processed.
+  const { data: pending, error: queueError } = await supabase
+    .from('products')
+    .select('id,title,price,image,link,reviews,rating')
+    .not('link', 'is', null)
+    .like('link', '%daraz.com.np%')
+    .not('link', 'like', '%/categories/%')
+    .order('created_at', { ascending: true })
+    .limit(100);
+  if (queueError) throw queueError;
 
-  if (!/^https?:\/\//i.test(productUrl)) {
-    const { data, error } = await supabase
-      .from('products')
-      .select('id,title,price,image,link,reviews,rating')
-      .not('link', 'is', null)
-      .order('updated_at', { ascending: true })
-      .limit(1)
-      .maybeSingle();
-    if (error) throw error;
-    existing = data;
-    productUrl = clean(data?.link || '', 2500);
-  } else {
-    const { data, error } = await supabase
-      .from('products')
-      .select('id,title,price,image,link,reviews,rating')
-      .eq('link', productUrl)
-      .limit(1)
-      .maybeSingle();
-    if (error) throw error;
-    existing = data;
+  const candidates = (pending || []).filter((p: any) => {
+    try {
+      const u = new URL(p.link);
+      return u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`;
+    } catch { return false; }
+  });
+
+  const urls = candidates.map((p: any) => p.link);
+  if (!urls.length) {
+    await Actor.pushData({ status: 'no_pending_daraz_products' });
+    await Actor.exit();
+    return;
   }
 
-  if (!/^https?:\/\//i.test(productUrl)) throw new Error('No product URL found in Supabase products.link');
+  let selected: any = null;
+  for (const candidate of candidates) {
+    const { data: already } = await supabase
+      .from('updated_specifications')
+      .select('id')
+      .eq('product_id', candidate.id)
+      .limit(1)
+      .maybeSingle();
+    if (!already) { selected = candidate; break; }
+  }
 
+  if (!selected) {
+    await Actor.pushData({ status: 'no_pending_daraz_products' });
+    await Actor.exit();
+    return;
+  }
+
+  const productUrl = clean(selected.link, 2500);
   const productId = productIdFromUrl(productUrl);
-  console.log(`SPEC_START | url=${productUrl}`);
+  console.log(`SPEC_START | daraz_url=${productUrl} | product_id=${selected.id}`);
+
   const extracted = await extractProduct(productUrl);
   console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
   console.log(`SPEC_TITLE | found=${extracted.specFound}`);
-  console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
   const specs = extracted.specs;
   const { error: saveError } = await supabase.from('updated_specifications').upsert({
-    product_id: existing?.id || null,
+    product_id: selected.id,
     product_url: productUrl,
     specifications: specs,
     source: 'apify-specification',
@@ -112,7 +134,13 @@ async function main() {
   }, { onConflict: 'product_url' });
   if (saveError) throw saveError;
 
-  await Actor.pushData({ url: productUrl, productId: existing?.id || null, status: Object.keys(specs).length ? 'updated' : 'no_verified_specs', specifications: specs });
+  await Actor.pushData({
+    url: productUrl,
+    status: Object.keys(specs).length ? 'updated' : 'no_verified_specs',
+    productId: selected.id,
+    specifications: specs
+  });
+
   console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications`);
   await Actor.exit();
 }
