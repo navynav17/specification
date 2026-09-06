@@ -7,7 +7,6 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const DARAZ_HOST = 'daraz.com.np';
 
 const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
-const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
 
 const CANONICAL: Record<string, string> = {
   brand: 'Brand', 'brand name': 'Brand', model: 'Model', 'model name': 'Model',
@@ -15,8 +14,10 @@ const CANONICAL: Record<string, string> = {
   'product type': 'Product Type', type: 'Product Type', warranty: 'Warranty',
   'warranty period': 'Warranty', weight: 'Weight', dimension: 'Dimensions', dimensions: 'Dimensions'
 };
-const BAD_KEY = /^(class|class name|style|display|position|width|height|top|left|right|bottom|margin|padding|color|background|font|font-family|font-size|line-height|opacity|visibility|z-index|float|text|overflow|content|skuid|brandid|lzd|selector|tag|node|element)$/i;
-const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined|inline-block|block|none|relative|absolute|fixed|visible|hidden|auto|inherit|initial)$/i;
+
+const ALLOWED_KEYS = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type)$/i;
+const BAD_KEY = /^(class|class name|style|display|position|width|height|top|left|right|bottom|margin|padding|background|font|font-family|font-size|line-height|opacity|visibility|z-index|float|text|overflow|content|skuid|brandid|lzd|selector|tag|node|element)$/i;
+const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined|inline-block|block|none|relative|absolute|fixed|visible|hidden|auto|inherit|initial|lzd\/popups)$/i;
 const UI_NOISE = /\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|more kitchen appliances|quantity)\b/i;
 
 function canonicalKey(key: string) {
@@ -28,17 +29,17 @@ function looksLikeRealPair(key: string, value: string) {
   const k = clean(key, 120);
   const v = clean(value, 350);
   if (!k || !v || BAD_KEY.test(k) || BAD_VALUE.test(v)) return false;
+  if (!ALLOWED_KEYS.test(k)) return false;
   if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
   if (UI_NOISE.test(v)) return false;
-  if (k.length > 100 || v.length > 350) return false;
-  if (!/[A-Za-z]/.test(k)) return false;
   return true;
 }
 
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const k = canonicalKey(clean(key, 120));
+  const rawKey = clean(key, 120);
+  const k = canonicalKey(rawKey);
   const v = clean(value, 350);
-  if (!looksLikeRealPair(k, v)) return;
+  if (!looksLikeRealPair(rawKey, v)) return;
   out[k] = v;
 }
 
@@ -51,24 +52,25 @@ async function extractProduct(url: string) {
       locale: 'en-US'
     });
     const page = await context.newPage();
-
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(5500);
 
-    for (let i = 0; i < 12; i++) {
+    // Trigger lazy loading throughout the page.
+    for (let i = 0; i < 14; i++) {
       await page.mouse.wheel(0, 1000);
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(450);
     }
     await page.waitForTimeout(2500);
 
+    // Expand Specifications where the page exposes it as a clickable control.
     try {
       const labels = page.getByText('Specifications', { exact: true });
       const count = await labels.count();
-      for (let i = 0; i < Math.min(count, 3); i++) {
+      for (let i = 0; i < Math.min(count, 5); i++) {
         try {
           await labels.nth(i).scrollIntoViewIfNeeded();
-          await labels.nth(i).click({ timeout: 1500 });
-          await page.waitForTimeout(1500);
+          await labels.nth(i).click({ timeout: 2000 });
+          await page.waitForTimeout(1200);
         } catch {}
       }
     } catch {}
@@ -79,11 +81,14 @@ async function extractProduct(url: string) {
       const seen = new Set();
       const push = (k, v) => {
         k = clean(k); v = clean(v);
-        if (!k || !v || seen.has(k + '\\u0000' + v)) return;
-        seen.add(k + '\\u0000' + v); rows.push([k, v]);
+        if (!k || !v) return;
+        const sig = k + '\\u0000' + v;
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        rows.push([k, v]);
       };
 
-      // Current Daraz specification structure.
+      // 1) Current Daraz specification component.
       for (const root of Array.from(document.querySelectorAll('.pdp-mod-specification'))) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
@@ -93,44 +98,44 @@ async function extractProduct(url: string) {
         }
       }
 
-      // Alternate key/value rows, but only near an actual Specifications heading.
-      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,div,span'))
+      // 2) Alternate specification tables near a real Specifications heading.
+      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p'))
         .filter(el => clean(el.textContent).toLowerCase() === 'specifications');
-      for (const heading of headings.slice(0, 5)) {
+      for (const heading of headings.slice(0, 8)) {
         let parent = heading.parentElement;
-        for (let depth = 0; depth < 5 && parent; depth++, parent = parent.parentElement) {
+        for (let depth = 0; depth < 6 && parent; depth++, parent = parent.parentElement) {
           for (const tr of parent.querySelectorAll('tr')) {
             const cells = Array.from(tr.querySelectorAll('th,td')).map(c => clean(c.textContent)).filter(Boolean);
             if (cells.length === 2) push(cells[0], cells[1]);
           }
+          for (const li of parent.querySelectorAll('li')) {
+            const texts = Array.from(li.querySelectorAll('span,div')).map(x => clean(x.textContent)).filter(Boolean);
+            if (texts.length === 2) push(texts[0], texts[1]);
+          }
         }
       }
 
-      // Embedded JSON fallback, limited to plausible specification field names.
-      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity)$/i;
+      // 3) Strict embedded-JSON fallback. Only known specification keys are admitted.
+      const allowed = /^(brand|brand name|model|model name|color|colour|color family|capacity|product type|type|warranty|warranty period|weight|dimensions?|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type)$/i;
       for (const script of Array.from(document.scripts)) {
         const text = script.textContent || '';
         if (!/specification|specifications|keyValue/i.test(text)) continue;
         const pairs = text.matchAll(/(?:\"|')([^\"']{2,80})(?:\"|')\\s*[:=]\\s*(?:\"|')([^\"']{1,300})(?:\"|')/g);
         for (const m of pairs) {
-          const k = clean(m[1]); const v = clean(m[2]);
+          const k = clean(m[1]);
+          const v = clean(m[2]);
           if (allowed.test(k)) push(k, v);
         }
       }
 
-      return {
-        rows,
-        title: clean(document.title || ''),
-        url: location.href,
-        bodyText: clean(document.body?.innerText || '').slice(0, 12000)
-      };
+      return { rows, title: clean(document.title || ''), url: location.href };
     })()`);
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
     await context.close();
-    return { specs, finalUrl: result.url, title: result.title, bodyText: result.bodyText };
+    return { specs, finalUrl: result.url, title: result.title };
   } finally {
     await browser.close();
   }
@@ -186,12 +191,7 @@ async function main() {
   const specs = extracted.specs;
   if (Object.keys(specs).length === 0) {
     console.log('SPEC_DONE | skipped empty/invalid extraction');
-    await Actor.pushData({
-      url: productUrl,
-      status: 'no_verified_specs',
-      productId: selected.id,
-      specifications: {}
-    });
+    await Actor.pushData({ url: productUrl, status: 'no_verified_specs', productId: selected.id, specifications: {} });
     await Actor.exit();
     return;
   }
