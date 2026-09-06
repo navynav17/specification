@@ -39,17 +39,12 @@ function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
 
 function collectNestedSpecs(root: unknown, out: Record<string, string>) {
   if (!root || typeof root !== 'object') return;
-  if (Array.isArray(root)) {
-    for (const x of root) collectNestedSpecs(x, out);
-    return;
-  }
+  if (Array.isArray(root)) { for (const x of root) collectNestedSpecs(x, out); return; }
   for (const [k, v] of Object.entries(root as Record<string, unknown>)) {
     if (BAD_KEY.test(k)) continue;
     if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
       if (SPEC_LABEL.test(clean(k, 120))) addSpec(out, k, v);
-    } else {
-      collectNestedSpecs(v, out);
-    }
+    } else collectNestedSpecs(v, out);
   }
 }
 
@@ -60,34 +55,30 @@ async function extractProduct(url: string) {
       viewport: { width: 1440, height: 1000 },
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
     });
-
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(3000);
 
-    const result = await page.evaluate(() => {
-      const clean = (v: unknown) => String(v ?? '').replace(/\s+/g, ' ').trim();
-      const rows: Array<[string, string]> = [];
-
+    const result = await page.evaluate(`(() => {
+      const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
+      const rows = [];
       for (const el of document.querySelectorAll('tr')) {
-        const cells = [...el.querySelectorAll('th,td')].map(x => clean(x.textContent)).filter(Boolean);
+        const cells = Array.from(el.querySelectorAll('th,td')).map(x => clean(x.textContent)).filter(Boolean);
         if (cells.length >= 2) rows.push([cells[0], cells.slice(1).join(' | ')]);
       }
-
       for (const el of document.querySelectorAll('dt')) {
         const dd = el.nextElementSibling;
-        if (dd?.tagName.toLowerCase() === 'dd') rows.push([clean(el.textContent), clean(dd.textContent)]);
+        if (dd && dd.tagName && dd.tagName.toLowerCase() === 'dd') rows.push([clean(el.textContent), clean(dd.textContent)]);
       }
-
       const bodyText = clean(document.body?.innerText || '');
       return {
         rows,
         bodyText,
-        scripts: [...document.scripts].map(s => s.textContent || '').filter(Boolean).join('\n')
+        scripts: Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).join('\\n')
       };
-    });
+    })()`);
 
     const specs: Record<string, string> = {};
-    for (const [k, v] of result.rows) addSpec(specs, k, v);
+    for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
     const jsonCandidates = ['__NEXT_DATA__', 'pageData', 'window.pageData', 'window.__pageData__'];
     for (const marker of jsonCandidates) {
@@ -100,11 +91,11 @@ async function extractProduct(url: string) {
         const ch = result.scripts[i];
         if (inString) {
           if (escaped) escaped = false;
-          else if (ch === '\\') escaped = true;
-          else if (ch === '"') inString = false;
+          else if (ch === '\\\\') escaped = true;
+          else if (ch === '\"') inString = false;
           continue;
         }
-        if (ch === '"') inString = true;
+        if (ch === '\"') inString = true;
         else if (ch === '{') depth++;
         else if (ch === '}' && --depth === 0) {
           try { collectNestedSpecs(JSON.parse(result.scripts.slice(start, i + 1)), specs); } catch {}
@@ -114,75 +105,53 @@ async function extractProduct(url: string) {
     }
 
     return { specs, title: clean(result.bodyText.slice(0, 500), 500), finalUrl: page.url() };
-  } finally {
-    await browser.close();
-  }
+  } finally { await browser.close(); }
 }
 
 async function main() {
   await Actor.init();
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
-
   const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
   const productUrl = clean(input.productUrl || input.url || '', 2500);
   if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required');
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
   const productId = productIdFromUrl(productUrl);
-
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
 
   const { data: existing, error: existingError } = await supabase
-    .from('products')
-    .select('id,title,price,image,link,reviews,rating,specifications')
-    .eq('link', productUrl)
-    .limit(1)
-    .maybeSingle();
+    .from('products').select('id,title,price,image,link,reviews,rating,specifications')
+    .eq('link', productUrl).limit(1).maybeSingle();
   if (existingError) throw existingError;
 
   const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
     ? existing.specifications as Record<string, unknown> : {};
   const merged: Record<string, unknown> = { ...current, ...extracted.specs };
 
-  const payload = {
-    title: clean(existing?.title || input.title || extracted.title || 'Daraz Product', 500),
-    price: Number(existing?.price || 0),
-    currency: 'NPR',
-    image: existing?.image || null,
-    link: productUrl,
-    reviews: existing?.reviews ?? null,
-    rating: existing?.rating ?? null,
-    search_term: 'product-url-specification',
-    website: 'Daraz Nepal',
-    marketplace_id: MARKETPLACE_ID,
-    external_id: productId,
-    specifications: merged
-  };
-
   if (!Object.keys(extracted.specs).length) {
     await Actor.pushData({ url: productUrl, status: 'no_verified_specs', specifications: current });
     console.log('SPEC_DONE | no verified specs');
-    await Actor.exit();
-    return;
+    await Actor.exit(); return;
   }
 
-  const { data: saved, error: saveError } = await supabase
-    .from('products')
-    .upsert(payload, { onConflict: 'marketplace_id,external_id' })
-    .select('id')
-    .single();
+  const payload = {
+    title: clean(existing?.title || input.title || extracted.title || 'Daraz Product', 500),
+    price: Number(existing?.price || 0), currency: 'NPR', image: existing?.image || null,
+    link: productUrl, reviews: existing?.reviews ?? null, rating: existing?.rating ?? null,
+    search_term: 'product-url-specification', website: 'Daraz Nepal',
+    marketplace_id: MARKETPLACE_ID, external_id: productId, specifications: merged
+  };
+
+  const { data: saved, error: saveError } = await supabase.from('products')
+    .upsert(payload, { onConflict: 'marketplace_id,external_id' }).select('id').single();
   if (saveError) throw saveError;
 
   await supabase.from('product_enrichment_queue').upsert({
-    product_id: saved.id,
-    brand: merged.Brand || null,
-    model: merged.Model || null,
-    product_type: merged['Product Type'] || null,
-    parse_status: 'parsed',
-    reason: 'Apify product URL specification actor',
-    specifications: merged,
+    product_id: saved.id, brand: merged.Brand || null, model: merged.Model || null,
+    product_type: merged['Product Type'] || null, parse_status: 'parsed',
+    reason: 'Apify product URL specification actor', specifications: merged,
     updated_at: new Date().toISOString()
   }, { onConflict: 'product_id' });
 
@@ -191,7 +160,4 @@ async function main() {
   await Actor.exit();
 }
 
-main().catch(async (error) => {
-  console.error(error);
-  try { await Actor.fail(); } catch {}
-});
+main().catch(async (error) => { console.error(error); try { await Actor.fail(); } catch {} });
