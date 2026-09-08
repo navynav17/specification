@@ -131,6 +131,23 @@ async function main() {
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
+  if (!Object.keys(extracted.specs).length) {
+    await Actor.pushData({
+      url: productUrl,
+      status: 'no_verified_specs',
+      specifications: {},
+      diagnostic: {
+        rootCount: extracted.rootCount,
+        specFound: extracted.specFound,
+        sectionText: extracted.sectionText,
+        finalUrl: extracted.finalUrl
+      }
+    });
+    console.log('SPEC_DONE | no verified specs');
+    await Actor.exit();
+    return;
+  }
+
   const { data: existing, error: existingError } = await supabase
     .from('products')
     .select('id,title,price,image,link,reviews,rating,specifications')
@@ -142,22 +159,6 @@ async function main() {
   const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
     ? existing.specifications as Record<string, unknown>
     : {};
-
-  if (!Object.keys(extracted.specs).length) {
-    await Actor.pushData({
-      url: productUrl,
-      status: 'no_verified_specs',
-      specifications: current,
-      diagnostic: {
-        rootCount: extracted.rootCount,
-        specFound: extracted.specFound,
-        sectionText: extracted.sectionText
-      }
-    });
-    console.log('SPEC_DONE | no verified specs');
-    await Actor.exit();
-    return;
-  }
 
   const merged: Record<string, unknown> = { ...current, ...extracted.specs };
   const payload = {
