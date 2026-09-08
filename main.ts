@@ -61,8 +61,6 @@ async function extractProduct(url: string) {
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Daraz can render the specification component well after DOMContentLoaded.
-    // Keep the exact Aura selector/extraction method; only improve the wait/readiness check.
     await page.waitForTimeout(5000);
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
