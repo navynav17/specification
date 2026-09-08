@@ -6,8 +6,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://foupthwcnnskqlzhoyep.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MARKETPLACE_ID = process.env.MARKETPLACE_ID || '6a4f8822-e1bc-4e8b-be61-4d1a400f3c13';
 
-const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\\s+/g, ' ').trim().slice(0, max);
-const productIdFromUrl = (url: string) => url.match(/(?:\\/i|\\/products\\/[^?#]*?-i)(\\d+)/i)?.[1] || url;
+const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
 
 const CANONICAL: Record<string, string> = {
   brand: 'Brand',
@@ -38,8 +38,8 @@ function canonicalKey(key: string) {
 function looksLikeRealValue(value: string) {
   const v = clean(value, 350);
   if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
-  if (/^https?:\\/\\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
-  if (/\\b(no ratings?|add to wishlist|out of stock|in stock|more kitchen appliances|more .* from)/i.test(v)) return false;
+  if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
+  if (/\b(no ratings?|add to wishlist|out of stock|in stock|more kitchen appliances|more .* from)/i.test(v)) return false;
   return true;
 }
 
@@ -68,7 +68,6 @@ async function extractProduct(url: string) {
     }
     await page.waitForTimeout(3000);
 
-    // Primary path: the exact DOM structure that successfully extracted Aura.
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
       const rows = [];
@@ -100,6 +99,29 @@ async function extractProduct(url: string) {
 
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
+
+    // Fallback: when the exact specification markup exists in the page HTML but the
+    // corresponding nodes are not available through the live DOM query.
+    if (!Object.keys(specs).length) {
+      const html = result.html as string;
+      const hasSpecMarkup = /pdp-mod-specification/i.test(html) && /specification-keys/i.test(html);
+      if (hasSpecMarkup) {
+        console.log('SPEC_HTML_FALLBACK | exact specification markup detected in raw HTML');
+        const rows: Array<[string, string]> = [];
+        const rowRe = /<li[^>]*class=["'][^"']*\bkey-li\b[^"']*["'][^>]*>[\s\S]*?<span[^>]*class=["'][^"']*\bkey-title\b[^"']*["'][^>]*>([\s\S]*?)<\/span>[\s\S]*?<div[^>]*class=["'][^"']*\bkey-value\b[^"']*["'][^>]*>([\s\S]*?)<\/div>[\s\S]*?<\/li>/gi;
+        let m: RegExpExecArray | null;
+        const strip = (x: string) => clean(x.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]*>/g, ' '));
+        while ((m = rowRe.exec(html)) !== null) {
+          const key = strip(m[1]);
+          const value = strip(m[2]);
+          if (key && value) rows.push([key, value]);
+        }
+        for (const [k, v] of rows) addSpec(specs, k, v);
+        console.log(`SPEC_HTML_FALLBACK_EXTRACTED | count=${Object.keys(specs).length}`);
+      }
+    }
 
     await context.close();
     return { specs, finalUrl: result.url, ...result };
@@ -133,28 +155,6 @@ async function main() {
   console.log(`SPEC_HTML_HAS_SPEC_ROWS | ${/specification-keys/i.test(extracted.html)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
-
-  // HTML fallback: useful when Daraz includes the exact specification markup in source
-  // but does not attach/render that component into the live DOM seen by querySelectorAll.
-  if (!Object.keys(extracted.specs).length && /pdp-mod-specification/i.test(extracted.html)) {
-    console.log('SPEC_HTML_FALLBACK | exact specification markup detected in raw HTML');
-
-    const htmlMatch = extracted.html.match(/<div[^>]*class=["'][^"']*pdp-mod-specification[^"']*["'][\\s\\S]*?<\\/div><\\/div><\\/div>/i);
-    if (htmlMatch) {
-      const fragment = htmlMatch[0];
-      const rows: Array<[string, string]> = [];
-      const rowRe = /<li[^>]*class=["'][^"']*key-li[^"']*["'][\\s\\S]*?<span[^>]*class=["'][^"']*key-title[^"']*["'][^>]*>([\\s\\S]*?)<\\/span>[\\s\\S]*?<div[^>]*class=["'][^"']*key-value[^"']*["'][^>]*>([\\s\\S]*?)<\\/div>[\\s\\S]*?<\\/li>/gi;
-      let m: RegExpExecArray | null;
-      while ((m = rowRe.exec(fragment)) !== null) {
-        const strip = (x: string) => clean(x.replace(/<[^>]*>/g, ' '));
-        const key = strip(m[1]);
-        const value = strip(m[2]);
-        if (key && value) rows.push([key, value]);
-      }
-      for (const [k, v] of rows) addSpec(extracted.specs, k, v);
-      console.log(`SPEC_HTML_FALLBACK_EXTRACTED | count=${Object.keys(extracted.specs).length}`);
-    }
-  }
 
   if (!Object.keys(extracted.specs).length) {
     await Actor.pushData({
