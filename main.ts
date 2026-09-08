@@ -50,6 +50,28 @@ function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
   out[k] = v;
 }
 
+function collectObjectPairs(node: unknown, out: Record<string, string>, depth = 0) {
+  if (depth > 8 || node == null) return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectObjectPairs(item, out, depth + 1);
+    return;
+  }
+  if (typeof node !== 'object') return;
+
+  const obj = node as Record<string, unknown>;
+  for (const [rawKey, rawValue] of Object.entries(obj)) {
+    if (typeof rawValue === 'string' || typeof rawValue === 'number' || typeof rawValue === 'boolean') {
+      const key = clean(rawKey, 120);
+      const value = clean(rawValue, 350);
+      if (/^(brand|brand name|model|model name|colour|color|color family|capacity|product type|type|warranty|warranty period|weight|dimension|dimensions|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i.test(key)) {
+        addSpec(out, key, value);
+      }
+    } else {
+      collectObjectPairs(rawValue, out, depth + 1);
+    }
+  }
+}
+
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -59,9 +81,24 @@ async function extractProduct(url: string) {
       locale: 'en-US'
     });
     const page = await context.newPage();
+    const networkPayloads: Array<{ url: string; contentType: string; text: string }> = [];
+
+    page.on('response', async response => {
+      const responseUrl = response.url();
+      const contentType = response.headers()['content-type'] || '';
+      const interesting = /(?:api|product|item|sku|spec|attribute|detail|page)/i.test(responseUrl) || /json/i.test(contentType);
+      if (!interesting) return;
+      try {
+        const text = await response.text();
+        if (text && text.length <= 500000) {
+          networkPayloads.push({ url: responseUrl, contentType, text });
+          if (networkPayloads.length > 80) networkPayloads.shift();
+        }
+      } catch {}
+    });
+
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(5000);
-
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(700);
@@ -77,7 +114,6 @@ async function extractProduct(url: string) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
         if (!title) continue;
-
         for (const li of root.querySelectorAll('ul.specification-keys > li.key-li')) {
           const key = clean(li.querySelector('.key-title')?.textContent || '');
           const value = clean(li.querySelector('.key-value')?.textContent || '');
@@ -100,26 +136,44 @@ async function extractProduct(url: string) {
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
-    // Fallback: when the exact specification markup exists in the page HTML but the
-    // corresponding nodes are not available through the live DOM query.
     if (!Object.keys(specs).length) {
       const html = result.html as string;
       const hasSpecMarkup = /pdp-mod-specification/i.test(html) && /specification-keys/i.test(html);
       if (hasSpecMarkup) {
         console.log('SPEC_HTML_FALLBACK | exact specification markup detected in raw HTML');
-        const rows: Array<[string, string]> = [];
         const rowRe = /<li[^>]*class=["'][^"']*\bkey-li\b[^"']*["'][^>]*>[\s\S]*?<span[^>]*class=["'][^"']*\bkey-title\b[^"']*["'][^>]*>([\s\S]*?)<\/span>[\s\S]*?<div[^>]*class=["'][^"']*\bkey-value\b[^"']*["'][^>]*>([\s\S]*?)<\/div>[\s\S]*?<\/li>/gi;
+        const strip = (x: string) => clean(x.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' '));
         let m: RegExpExecArray | null;
-        const strip = (x: string) => clean(x.replace(/<script[\s\S]*?<\/script>/gi, ' ')
-          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-          .replace(/<[^>]*>/g, ' '));
-        while ((m = rowRe.exec(html)) !== null) {
-          const key = strip(m[1]);
-          const value = strip(m[2]);
-          if (key && value) rows.push([key, value]);
-        }
-        for (const [k, v] of rows) addSpec(specs, k, v);
+        while ((m = rowRe.exec(html)) !== null) addSpec(specs, strip(m[1]), strip(m[2]));
         console.log(`SPEC_HTML_FALLBACK_EXTRACTED | count=${Object.keys(specs).length}`);
+      }
+    }
+
+    if (!Object.keys(specs).length) {
+      for (const payload of networkPayloads) {
+        if (!/(?:spec|attribute|product|sku|detail)/i.test(payload.url)) continue;
+        const text = payload.text;
+        try {
+          const json = JSON.parse(text);
+          collectObjectPairs(json, specs);
+        } catch {
+          const pairs = text.match(/\"([^\"]{2,80})\"\s*:\s*\"([^\"]{1,350})\"/g) || [];
+          for (const pair of pairs) {
+            const match = pair.match(/^\"([^\"]{2,80})\"\s*:\s*\"([^\"]{1,350})\"$/);
+            if (match) addSpec(specs, match[1], match[2]);
+          }
+        }
+        if (Object.keys(specs).length) {
+          console.log(`SPEC_NETWORK_MATCH | url=${payload.url} | count=${Object.keys(specs).length}`);
+          break;
+        }
+      }
+    }
+
+    if (!Object.keys(specs).length) {
+      console.log(`SPEC_NETWORK_DIAGNOSTIC | captured=${networkPayloads.length}`);
+      for (const p of networkPayloads.slice(-30)) {
+        console.log(`SPEC_NETWORK | ${p.contentType} | ${p.url}`);
       }
     }
 
