@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://foupthwcnnskqlzhoyep.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+const cleanDescription = (v: unknown) => String(v ?? '').replace(/\s+/g, ' ').trim();
 const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
 
 const UI_NOISE = /^(more|from|no ratings?|ratings?|add to wishlist|share|report|quantity|out of stock|in stock|more kitchen appliances|more .* from|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|emi|flash sale|choice|follow|chat now|message)$/i;
@@ -55,11 +56,20 @@ async function extractProduct(url: string) {
           if (key && value) rows.push([key, value]);
         }
       }
+
+      const descriptionRoot = document.querySelector('#module_product_detail.pdp-block.module')
+        || document.querySelector('#module_product_detail');
+      const description = descriptionRoot ? clean(descriptionRoot.textContent || '') : '';
+      const descriptionHtml = descriptionRoot?.innerHTML?.trim() || '';
+
       return {
         rows,
+        description,
+        descriptionHtml,
         rootCount: roots.length,
         specFound: roots.some(root => Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .some(el => clean(el.textContent).toLowerCase() === 'specifications')),
+        descriptionFound: !!descriptionRoot && !!description,
         title: document.title,
         url: location.href
       };
@@ -74,11 +84,13 @@ async function extractProduct(url: string) {
   }
 }
 
-async function saveSpecs(supabase: any, product: any, specs: Record<string, string>) {
+async function saveProductData(supabase: any, product: any, specs: Record<string, string>, description: string) {
   const current = product.specifications && typeof product.specifications === 'object' && !Array.isArray(product.specifications)
     ? product.specifications as Record<string, unknown> : {};
   const merged = { ...current, ...specs };
-  const { error } = await supabase.from('products').update({ specifications: merged }).eq('id', product.id);
+  const update: Record<string, unknown> = { specifications: merged };
+  if (description) update.description = description;
+  const { error } = await supabase.from('products').update(update).eq('id', product.id);
   if (error) throw error;
   return merged;
 }
@@ -94,23 +106,26 @@ async function processOne(supabase: any, product: any, index: number, total: num
     const extracted = await extractProduct(url);
     console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
     console.log(`SPEC_TITLE | found=${extracted.specFound}`);
+    console.log(`DESCRIPTION | found=${extracted.descriptionFound} | chars=${extracted.description.length}`);
     console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.url}`);
-    if (!Object.keys(extracted.specs).length) {
-      console.log(`PRODUCT_NO_SPECS | ${index}/${total}`);
+
+    if (!Object.keys(extracted.specs).length && !extracted.description) {
+      console.log(`PRODUCT_NO_DATA | ${index}/${total}`);
       return 'no_specs';
     }
-    const merged = await saveSpecs(supabase, product, extracted.specs);
+
+    const merged = await saveProductData(supabase, product, extracted.specs, extracted.description);
     await supabase.from('product_enrichment_queue').upsert({
       product_id: product.id,
       brand: merged.Brand || null,
       model: merged.Model || null,
       product_type: merged['Product Type'] || null,
       parse_status: 'parsed',
-      reason: 'Apify product URL specification actor',
+      reason: 'Apify product URL specification and description actor',
       specifications: merged,
       updated_at: new Date().toISOString()
     }, { onConflict: 'product_id' });
-    console.log(`PRODUCT_DONE | ${index}/${total} | specs=${Object.keys(extracted.specs).length}`);
+    console.log(`PRODUCT_DONE | ${index}/${total} | specs=${Object.keys(extracted.specs).length} | description=${extracted.description.length} chars`);
     return 'success';
   } catch (error) {
     console.error(`PRODUCT_FAILED | ${index}/${total} | ${error instanceof Error ? error.message : String(error)}`);
@@ -123,7 +138,7 @@ async function runAll(supabase: any) {
   const pageSize = 200;
   for (let offset = 0; ; offset += pageSize) {
     const { data, error } = await supabase.from('products')
-      .select('id,title,link,specifications')
+      .select('id,title,link,specifications,description')
       .ilike('website', '%daraz%')
       .ilike('link', '%daraz.com.np%')
       .not('link', 'is', null)
@@ -161,7 +176,7 @@ async function main() {
   const productUrl = clean(input.productUrl || input.url || '', 2500);
   if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required, or set runAll=true');
   const { data: product, error } = await supabase.from('products')
-    .select('id,title,link,specifications')
+    .select('id,title,link,specifications,description')
     .eq('link', productUrl).limit(1).maybeSingle();
   if (error) throw error;
   if (!product) throw new Error(`Product not found in Supabase: ${productUrl}`);
