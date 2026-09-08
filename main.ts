@@ -60,13 +60,23 @@ async function extractProduct(url: string) {
     });
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3500);
 
+    // Daraz can render the specification component well after DOMContentLoaded.
+    // Keep the exact Aura selector/extraction method; only improve the wait/readiness check.
+    await page.waitForTimeout(5000);
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(700);
     }
-    await page.waitForTimeout(1500);
+
+    try {
+      await page.waitForSelector('.pdp-mod-specification .pdp-mod-section-title', {
+        state: 'attached',
+        timeout: 15000
+      });
+    } catch {}
+
+    await page.waitForTimeout(3000);
 
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
@@ -95,6 +105,8 @@ async function extractProduct(url: string) {
         specFound: !!specRoot,
         sectionText: clean(specRoot?.innerText || '').slice(0, 15000),
         html: specRoot?.outerHTML?.slice(0, 30000) || '',
+        title: document.title,
+        bodyTextSample: clean(document.body?.innerText || '').slice(0, 12000),
         url: location.href
       };
     })()`);
@@ -128,6 +140,8 @@ async function main() {
   console.log(`SPEC_TITLE | found=${extracted.specFound} | text=${extracted.specFound ? 'Specifications' : ''}`);
   console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
   console.log(`SPEC_HTML | ${extracted.html}`);
+  console.log(`SPEC_PAGE_TITLE | ${JSON.stringify(extracted.title)}`);
+  console.log(`SPEC_BODY_SAMPLE | ${JSON.stringify(extracted.bodyTextSample)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
@@ -140,7 +154,9 @@ async function main() {
         rootCount: extracted.rootCount,
         specFound: extracted.specFound,
         sectionText: extracted.sectionText,
-        finalUrl: extracted.finalUrl
+        finalUrl: extracted.finalUrl,
+        title: extracted.title,
+        bodyTextSample: extracted.bodyTextSample
       }
     });
     console.log('SPEC_DONE | no verified specs');
