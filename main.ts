@@ -144,9 +144,21 @@ async function extractDescription(url: string) {
 
 async function saveDescription(supabase: any, product: any, description: string) {
   if (!description) return false;
-  const { error } = await supabase.from('products').update({ description }).eq('id', product.id);
+  const { error } = await supabase.from('products').update({
+    description,
+    description_scraped: true,
+    description_scraped_at: new Date().toISOString()
+  }).eq('id', product.id);
   if (error) throw error;
   return true;
+}
+
+async function markDescriptionAttempted(supabase: any, product: any) {
+  const { error } = await supabase.from('products').update({
+    description_scraped: true,
+    description_scraped_at: new Date().toISOString()
+  }).eq('id', product.id);
+  if (error) throw error;
 }
 
 async function processOne(supabase: any, product: any, index: number, total: number) {
@@ -154,6 +166,7 @@ async function processOne(supabase: any, product: any, index: number, total: num
     const extracted = await extractDescription(product.link);
     console.log(`DESCRIPTION | found=${extracted.descriptionFound} | chars=${extracted.description.length} | source=${extracted.descriptionSource || 'none'}`);
     if (!extracted.description) {
+      await markDescriptionAttempted(supabase, product);
       console.log(`PRODUCT_NO_DESCRIPTION | ${index}/${total}`);
       return 'no_description';
     }
@@ -175,15 +188,19 @@ async function processOne(supabase: any, product: any, index: number, total: num
 async function runAll(supabase: any) {
   const pageSize = 200;
   let processed = 0, success = 0, failed = 0, noDescription = 0;
-  for (let offset = 0; ; offset += pageSize) {
+  for (;;) {
     const { data, error } = await supabase.from('products')
-      .select('id,title,link,description')
+      .select('id,title,link,description,description_scraped')
       .ilike('website', '%daraz%')
       .ilike('link', '%daraz.com.np%')
       .not('link', 'is', null)
-      .range(offset, offset + pageSize - 1);
+      .eq('description_scraped', false)
+      .order('id', { ascending: true })
+      .limit(pageSize);
     if (error) throw error;
     if (!data?.length) break;
+
+    console.log(`BATCH_START | size=${data.length}`);
     for (const product of data) {
       processed++;
       const result = await processOne(supabase, product, processed, 0);
@@ -191,7 +208,6 @@ async function runAll(supabase: any) {
       else if (result === 'failed') failed++;
       else noDescription++;
     }
-    if (data.length < pageSize) break;
   }
   console.log(`RUN_ALL_DONE | processed=${processed} | success=${success} | no_description=${noDescription} | failed=${failed}`);
 }
@@ -215,7 +231,7 @@ async function main() {
   if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required, or set runAll=true');
 
   const { data: product, error } = await supabase.from('products')
-    .select('id,title,link,description')
+    .select('id,title,link,description,description_scraped')
     .eq('link', productUrl)
     .limit(1)
     .maybeSingle();
@@ -226,6 +242,7 @@ async function main() {
   console.log(`DESCRIPTION | found=${extracted.descriptionFound} | chars=${extracted.description.length} | source=${extracted.descriptionSource || 'none'}`);
 
   if (!extracted.description) {
+    await markDescriptionAttempted(supabase, product);
     await Actor.pushData({ url: productUrl, status: 'no_description', description: '' });
     await Actor.exit();
     return;
