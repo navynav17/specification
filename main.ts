@@ -50,8 +50,20 @@ function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
   out[k] = v;
 }
 
+function extractRowsFromHtml(html: string) {
+  const rows: Array<[string, string]> = [];
+  const liMatches = html.match(/<li\b[^>]*class=["'][^"']*key-li[^"']*["'][^>]*>[\s\S]*?<\/li>/gi) || [];
+  for (const li of liMatches) {
+    const key = clean((li.match(/<[^>]*class=["'][^"']*key-title[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1] || '').replace(/<[^>]+>/g, ''));
+    const value = clean((li.match(/<[^>]*class=["'][^"']*key-value[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1] || '').replace(/<[^>]+>/g, ''));
+    if (key && value) rows.push([key, value]);
+  }
+  return rows;
+}
+
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
+  const networkBodies: Array<{ url: string; contentType: string; text: string }> = [];
   try {
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1200 },
@@ -59,23 +71,30 @@ async function extractProduct(url: string) {
       locale: 'en-US'
     });
     const page = await context.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
+    page.on('response', async response => {
+      try {
+        const headers = response.headers();
+        const contentType = String(headers['content-type'] || '').toLowerCase();
+        const responseUrl = response.url();
+        if (!/json|javascript|html|text/i.test(contentType)) return;
+        if (!/daraz\.com\.np|lazada|api|product|sku|spec/i.test(responseUrl)) return;
+        const text = await response.text();
+        if (text && text.length < 1000000) {
+          networkBodies.push({ url: responseUrl, contentType, text });
+        }
+      } catch {}
+    });
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(5000);
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(700);
     }
-
-    try {
-      await page.waitForSelector('.pdp-mod-specification .pdp-mod-section-title', {
-        state: 'attached',
-        timeout: 15000
-      });
-    } catch {}
-
     await page.waitForTimeout(3000);
 
+    // Exact working Aura extractor remains the first extraction path.
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
       const roots = Array.from(document.querySelectorAll('.pdp-mod-specification'));
@@ -94,6 +113,15 @@ async function extractProduct(url: string) {
         }
       }
 
+      const allClassMatches = Array.from(document.querySelectorAll('[class*="pdp-mod-specification"]'))
+        .map(el => ({ tag: el.tagName, cls: el.className, text: clean(el.innerText || el.textContent || '').slice(0, 5000) }))
+        .slice(0, 20);
+
+      const specTextMatches = Array.from(document.querySelectorAll('body *'))
+        .filter(el => clean(el.textContent).toLowerCase() === 'specifications')
+        .map(el => ({ tag: el.tagName, cls: el.className, parent: el.parentElement?.className || '', text: clean(el.parentElement?.innerText || '').slice(0, 5000) }))
+        .slice(0, 20);
+
       const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title'))
         .some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
 
@@ -103,6 +131,9 @@ async function extractProduct(url: string) {
         specFound: !!specRoot,
         sectionText: clean(specRoot?.innerText || '').slice(0, 15000),
         html: specRoot?.outerHTML?.slice(0, 30000) || '',
+        allClassMatches,
+        specTextMatches,
+        fullHtmlSample: document.documentElement.outerHTML.slice(0, 120000),
         title: document.title,
         bodyTextSample: clean(document.body?.innerText || '').slice(0, 12000),
         url: location.href
@@ -112,8 +143,42 @@ async function extractProduct(url: string) {
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
+    const htmlRows = extractRowsFromHtml(result.fullHtmlSample || '');
+    const htmlSpecs: Record<string, string> = {};
+    for (const [k, v] of htmlRows) addSpec(htmlSpecs, k, v);
+
+    // Network fallback: search captured JSON/text for known Daraz specification row patterns.
+    const networkSpecs: Record<string, string> = {};
+    const candidateResponses: Array<{ url: string; text: string }> = [];
+    for (const body of networkBodies) {
+      if (body.text.includes('specification') || body.text.includes('specifications') || body.text.includes('skuId')) {
+        candidateResponses.push({ url: body.url, text: body.text });
+      }
+      const matches = body.text.matchAll(/(?:"key"|"name"|"label")\s*:\s*"([^"]+)"\s*,\s*(?:"value"|"displayValue"|"text")\s*:\s*"([^"]+)"/gi);
+      for (const m of matches) addSpec(networkSpecs, m[1], m[2]);
+      const attrMatches = body.text.matchAll(/(?:"name"|"label")\s*:\s*"([^"]+)"[^{}]{0,300}?(?:"value"|"displayValue"|"text")\s*:\s*"([^"]+)"/gi);
+      for (const m of attrMatches) addSpec(networkSpecs, m[1], m[2]);
+    }
+
+    console.log(`SPEC_ALT_CLASS | ${JSON.stringify(result.allClassMatches)}`);
+    console.log(`SPEC_TEXT_MATCHES | ${JSON.stringify(result.specTextMatches)}`);
+    console.log(`SPEC_HTML_ROWS | ${JSON.stringify(htmlSpecs)}`);
+    console.log(`SPEC_NETWORK_RESPONSES | count=${candidateResponses.length}`);
+    for (const item of candidateResponses.slice(0, 10)) {
+      console.log(`SPEC_NETWORK | url=${item.url} | sample=${JSON.stringify(clean(item.text, 12000))}`);
+    }
+
+    const mergedSpecs = Object.keys(specs).length ? specs : (Object.keys(htmlSpecs).length ? htmlSpecs : networkSpecs);
+
     await context.close();
-    return { specs, finalUrl: result.url, ...result };
+    return {
+      specs: mergedSpecs,
+      exactSpecs: specs,
+      htmlSpecs,
+      networkSpecs,
+      finalUrl: result.url,
+      ...result
+    };
   } finally {
     await browser.close();
   }
@@ -141,6 +206,9 @@ async function main() {
   console.log(`SPEC_PAGE_TITLE | ${JSON.stringify(extracted.title)}`);
   console.log(`SPEC_BODY_SAMPLE | ${JSON.stringify(extracted.bodyTextSample)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
+  console.log(`SPEC_EXACT | ${JSON.stringify(extracted.exactSpecs)}`);
+  console.log(`SPEC_HTML_FALLBACK | ${JSON.stringify(extracted.htmlSpecs)}`);
+  console.log(`SPEC_NETWORK_FALLBACK | ${JSON.stringify(extracted.networkSpecs)}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
   if (!Object.keys(extracted.specs).length) {
@@ -154,7 +222,9 @@ async function main() {
         sectionText: extracted.sectionText,
         finalUrl: extracted.finalUrl,
         title: extracted.title,
-        bodyTextSample: extracted.bodyTextSample
+        bodyTextSample: extracted.bodyTextSample,
+        altClassMatches: extracted.allClassMatches,
+        specTextMatches: extracted.specTextMatches
       }
     });
     console.log('SPEC_DONE | no verified specs');
