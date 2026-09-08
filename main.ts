@@ -41,6 +41,16 @@ function collectDescription(node: unknown, out: { value: string }, depth = 0) {
   }
 }
 
+function detectChallenge(title: string, bodyText: string, html: string) {
+  const sample = `${title}\n${bodyText.slice(0, 20000)}\n${html.slice(0, 50000)}`.toLowerCase();
+  const markers = [
+    'captcha', 'verify you are human', 'verify you\'re human', 'security check',
+    'access denied', 'unusual traffic', 'robot check', 'are you a robot',
+    'challenge', 'please verify', 'checking your browser'
+  ];
+  return markers.filter(marker => sample.includes(marker));
+}
+
 async function extractDescription(url: string) {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -66,7 +76,9 @@ async function extractDescription(url: string) {
       } catch {}
     });
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log(`PAGE_RESPONSE | status=${response?.status() ?? 'none'} | url=${response?.url() || url}`);
+
     await page.waitForTimeout(5000);
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
@@ -78,15 +90,43 @@ async function extractDescription(url: string) {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
       const descriptionRoot = document.querySelector('#module_product_detail.pdp-block.module') || document.querySelector('#module_product_detail');
       const description = descriptionRoot ? clean(descriptionRoot.textContent || '') : '';
+      const bodyText = clean(document.body?.innerText || '');
+      const bodyHtml = document.body?.innerHTML || '';
+      const moduleHtml = descriptionRoot ? descriptionRoot.outerHTML : '';
       const scriptJson = Array.from(document.querySelectorAll('script[type="application/json"]')).map(s => s.textContent || '').filter(Boolean);
+      const challengeSelectors = [
+        '[id*="captcha" i]', '[class*="captcha" i]', '[id*="challenge" i]',
+        '[class*="challenge" i]', 'iframe[src*="captcha" i]', 'iframe[src*="challenge" i]'
+      ];
+      const challengeElements = challengeSelectors.reduce((count, selector) => count + document.querySelectorAll(selector).length, 0);
       return {
         description,
         scriptJson,
         title: document.title,
         url: location.href,
-        descriptionFound: !!description
+        bodyText,
+        bodyHtml,
+        moduleHtml,
+        moduleFound: !!descriptionRoot,
+        moduleTextLength: description.length,
+        moduleHtmlLength: moduleHtml.length,
+        bodyTextLength: bodyText.length,
+        bodyHtmlLength: bodyHtml.length,
+        challengeElements
       };
     })()`);
+
+    const challengeMarkers = detectChallenge(result.title as string, result.bodyText as string, result.bodyHtml as string);
+    console.log(`PAGE_DIAGNOSTIC | title=${clean(result.title, 300)} | finalUrl=${clean(result.url, 500)}`);
+    console.log(`PAGE_DIAGNOSTIC | bodyTextLength=${result.bodyTextLength} | bodyHtmlLength=${result.bodyHtmlLength} | moduleFound=${result.moduleFound} | moduleTextLength=${result.moduleTextLength} | moduleHtmlLength=${result.moduleHtmlLength}`);
+    console.log(`PAGE_DIAGNOSTIC | challengeElements=${result.challengeElements} | challengeMarkers=${challengeMarkers.length ? challengeMarkers.join(',') : 'none'} | applicationJson=${(result.scriptJson as string[]).length} | networkPayloads=${networkPayloads.length}`);
+    console.log(`PAGE_BODY_START | ${clean(result.bodyText, 1500)}`);
+    if (result.moduleFound) console.log(`MODULE_TEXT_START | ${clean(result.description, 1500)}`);
+    else console.log('MODULE_TEXT_START | NOT_FOUND');
+
+    if (challengeMarkers.length || Number(result.challengeElements) > 0) {
+      throw new Error(`ANTIBOT_CHALLENGE | markers=${challengeMarkers.join(',') || 'selector'} | title=${clean(result.title, 200)}`);
+    }
 
     let description = result.description as string;
     let descriptionSource = description ? 'dom' : '';
@@ -97,10 +137,13 @@ async function extractDescription(url: string) {
       const match = html.match(moduleRe);
       if (match) {
         const candidate = stripHtml(match[1], 12000);
+        console.log(`HTML_MODULE_FALLBACK | chars=${candidate.length}`);
         if (looksLikeDescription(candidate)) {
           description = candidate;
           descriptionSource = 'html';
         }
+      } else {
+        console.log('HTML_MODULE_FALLBACK | module_not_found');
       }
     }
 
@@ -113,6 +156,7 @@ async function extractDescription(url: string) {
           if (found.value) {
             description = found.value;
             descriptionSource = 'html-json';
+            console.log(`HTML_JSON_DESCRIPTION_MATCH | chars=${description.length}`);
             break;
           }
         } catch {}
@@ -163,6 +207,7 @@ async function markDescriptionAttempted(supabase: any, product: any) {
 
 async function processOne(supabase: any, product: any, index: number, total: number) {
   try {
+    console.log(`PRODUCT_START | ${index}/${total} | ${product.link}`);
     const extracted = await extractDescription(product.link);
     console.log(`DESCRIPTION | found=${extracted.descriptionFound} | chars=${extracted.description.length} | source=${extracted.descriptionSource || 'none'}`);
     if (!extracted.description) {
