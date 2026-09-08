@@ -25,7 +25,7 @@ function looksLikeDescription(value: string) {
 }
 
 function collectDescription(node: unknown, out: { value: string }, depth = 0) {
-  if (depth > 10 || node == null || out.value) return;
+  if (depth > 12 || node == null || out.value) return;
   if (Array.isArray(node)) {
     for (const item of node) collectDescription(item, out, depth + 1);
     return;
@@ -39,6 +39,20 @@ function collectDescription(node: unknown, out: { value: string }, depth = 0) {
     }
     if (rawValue && typeof rawValue === 'object') collectDescription(rawValue, out, depth + 1);
   }
+}
+
+function extractDescriptionFromText(text: string) {
+  const out = { value: '' };
+  const keyPattern = '(?:description|productDescription|desc|descriptionHtml|productDesc|itemDescription|shortDescription|longDescription)';
+  const re = new RegExp(`[\\\"']${keyPattern}[\\\"']\\s*:\\s*[\\\"']((?:\\\\.|[^\\\"']){30,})[\\\"']`, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    let candidate = match[1];
+    try { candidate = JSON.parse(`"${candidate.replace(/"/g, '\\"')}"`); } catch {}
+    candidate = stripHtml(candidate, 12000);
+    if (looksLikeDescription(candidate)) { out.value = candidate; break; }
+  }
+  return out.value;
 }
 
 function detectChallenge(title: string, bodyText: string, html: string) {
@@ -65,7 +79,7 @@ async function extractDescription(url: string) {
     page.on('response', async response => {
       const responseUrl = response.url();
       const contentType = response.headers()['content-type'] || '';
-      const interesting = /(?:api|product|item|sku|detail|page)/i.test(responseUrl) || /json/i.test(contentType);
+      const interesting = /(?:api|product|item|sku|detail|page|pdp)/i.test(responseUrl) || /json/i.test(contentType);
       if (!interesting) return;
       try {
         const text = await response.text();
@@ -88,12 +102,25 @@ async function extractDescription(url: string) {
 
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
-      const descriptionRoot = document.querySelector('#module_product_detail.pdp-block.module') || document.querySelector('#module_product_detail');
+      const selectors = [
+        '#module_product_detail.pdp-block.module',
+        '#module_product_detail',
+        '[id*="product_detail" i]',
+        '[id*="product-description" i]',
+        '[class*="product-description" i]',
+        '[class*="pdp-block__product-description" i]'
+      ];
+      let descriptionRoot = null;
+      for (const selector of selectors) {
+        const found = document.querySelector(selector);
+        if (found) { descriptionRoot = found; break; }
+      }
       const description = descriptionRoot ? clean(descriptionRoot.textContent || '') : '';
       const bodyText = clean(document.body?.innerText || '');
       const bodyHtml = document.body?.innerHTML || '';
       const moduleHtml = descriptionRoot ? descriptionRoot.outerHTML : '';
-      const scriptJson = Array.from(document.querySelectorAll('script[type="application/json"]')).map(s => s.textContent || '').filter(Boolean);
+      const applicationJson = Array.from(document.querySelectorAll('script[type="application/json"]')).map(s => s.textContent || '').filter(Boolean);
+      const allScripts = Array.from(document.scripts).map(s => s.textContent || '').filter(t => t.length >= 20 && t.length <= 500000);
       const challengeSelectors = [
         '[id*="captcha" i]', '[class*="captcha" i]', '[id*="challenge" i]',
         '[class*="challenge" i]', 'iframe[src*="captcha" i]', 'iframe[src*="challenge" i]'
@@ -101,7 +128,8 @@ async function extractDescription(url: string) {
       const challengeElements = challengeSelectors.reduce((count, selector) => count + document.querySelectorAll(selector).length, 0);
       return {
         description,
-        scriptJson,
+        applicationJson,
+        allScripts,
         title: document.title,
         url: location.href,
         bodyText,
@@ -119,7 +147,7 @@ async function extractDescription(url: string) {
     const challengeMarkers = detectChallenge(result.title as string, result.bodyText as string, result.bodyHtml as string);
     console.log(`PAGE_DIAGNOSTIC | title=${clean(result.title, 300)} | finalUrl=${clean(result.url, 500)}`);
     console.log(`PAGE_DIAGNOSTIC | bodyTextLength=${result.bodyTextLength} | bodyHtmlLength=${result.bodyHtmlLength} | moduleFound=${result.moduleFound} | moduleTextLength=${result.moduleTextLength} | moduleHtmlLength=${result.moduleHtmlLength}`);
-    console.log(`PAGE_DIAGNOSTIC | challengeElements=${result.challengeElements} | challengeMarkers=${challengeMarkers.length ? challengeMarkers.join(',') : 'none'} | applicationJson=${(result.scriptJson as string[]).length} | networkPayloads=${networkPayloads.length}`);
+    console.log(`PAGE_DIAGNOSTIC | challengeElements=${result.challengeElements} | challengeMarkers=${challengeMarkers.length ? challengeMarkers.join(',') : 'none'} | applicationJson=${(result.applicationJson as string[]).length} | allScripts=${(result.allScripts as string[]).length} | networkPayloads=${networkPayloads.length}`);
     console.log(`PAGE_BODY_START | ${clean(result.bodyText, 1500)}`);
     if (result.moduleFound) console.log(`MODULE_TEXT_START | ${clean(result.description, 1500)}`);
     else console.log('MODULE_TEXT_START | NOT_FOUND');
@@ -148,7 +176,7 @@ async function extractDescription(url: string) {
     }
 
     if (!description) {
-      for (const scriptText of (result.scriptJson as string[])) {
+      for (const scriptText of (result.applicationJson as string[])) {
         try {
           const json = JSON.parse(scriptText);
           const found = { value: '' };
@@ -160,6 +188,29 @@ async function extractDescription(url: string) {
             break;
           }
         } catch {}
+      }
+    }
+
+    if (!description) {
+      for (const scriptText of (result.allScripts as string[])) {
+        try {
+          const json = JSON.parse(scriptText);
+          const found = { value: '' };
+          collectDescription(json, found);
+          if (found.value) {
+            description = found.value;
+            descriptionSource = 'script-json';
+            console.log(`SCRIPT_JSON_DESCRIPTION_MATCH | chars=${description.length}`);
+            break;
+          }
+        } catch {}
+        const textMatch = extractDescriptionFromText(scriptText);
+        if (textMatch) {
+          description = textMatch;
+          descriptionSource = 'script-text';
+          console.log(`SCRIPT_TEXT_DESCRIPTION_MATCH | chars=${description.length}`);
+          break;
+        }
       }
     }
 
@@ -176,6 +227,23 @@ async function extractDescription(url: string) {
             break;
           }
         } catch {}
+        const textMatch = extractDescriptionFromText(payload.text);
+        if (textMatch) {
+          description = textMatch;
+          descriptionSource = 'network-text';
+          console.log(`DESCRIPTION_NETWORK_TEXT_MATCH | url=${payload.url} | chars=${description.length}`);
+          break;
+        }
+      }
+    }
+
+    if (!description) {
+      const html = await page.content();
+      const htmlMatch = extractDescriptionFromText(html);
+      if (htmlMatch) {
+        description = htmlMatch;
+        descriptionSource = 'html-text';
+        console.log(`HTML_TEXT_DESCRIPTION_MATCH | chars=${description.length}`);
       }
     }
 
