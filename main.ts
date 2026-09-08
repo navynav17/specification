@@ -4,9 +4,10 @@ import { chromium } from 'playwright';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://foupthwcnnskqlzhoyep.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const DARAZ_HOST = 'daraz.com.np';
+const MARKETPLACE_ID = process.env.MARKETPLACE_ID || '6a4f8822-e1bc-4e8b-be61-4d1a400f3c13';
 
 const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
 
 const CANONICAL: Record<string, string> = {
   brand: 'Brand',
@@ -26,32 +27,26 @@ const CANONICAL: Record<string, string> = {
   dimensions: 'Dimensions'
 };
 
-const ALLOWED_KEYS = /^(brand|brand name|model|model name|colour|color|color family|capacity|product type|type|warranty|warranty period|weight|dimension|dimensions|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i;
-const BAD_KEY = /^(class|class name|style|display|position|width|height|top|left|right|bottom|margin|padding|background|font|font-family|font-size|line-height|opacity|visibility|z-index|float|text|overflow|content|skuid|brandid|lzd|selector|tag|node|element|href|src|id|name)$/i;
-const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined|inline-block|block|none|relative|absolute|fixed|visible|hidden|auto|inherit|initial|lzd\/popups|lzd\/age-restriction)$/i;
-const BAD_VALUE_PARTS = /(^|[\s:/_-])(?:lzd|skuId|brand_id|age-restriction|popups|inline-block|javascript)([\s:/_-]|$)/i;
-const UI_NOISE = /\b(no ratings?|add to wishlist|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|more kitchen appliances|quantity|wishlist|share|report|chat now)\b/i;
+const UI_NOISE = /^(more|from|no ratings?|ratings?|add to wishlist|share|report|quantity|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|emi|flash sale|choice|follow|chat now|message)$/i;
+const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined)$/i;
 
 function canonicalKey(key: string) {
   const k = clean(key, 120).toLowerCase();
   return CANONICAL[k] || clean(key, 120);
 }
 
-function looksLikeRealPair(key: string, value: string) {
-  const k = clean(key, 120);
+function looksLikeRealValue(value: string) {
   const v = clean(value, 350);
-  if (!k || !v || BAD_KEY.test(k) || BAD_VALUE.test(v) || BAD_VALUE_PARTS.test(v)) return false;
-  if (!ALLOWED_KEYS.test(k)) return false;
+  if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
   if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
-  if (UI_NOISE.test(v)) return false;
+  if (/\b(no ratings?|add to wishlist|out of stock|in stock|more kitchen appliances|more .* from)/i.test(v)) return false;
   return true;
 }
 
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const rawKey = clean(key, 120);
-  const k = canonicalKey(rawKey);
+  const k = canonicalKey(clean(key, 120));
   const v = clean(value, 350);
-  if (!looksLikeRealPair(rawKey, v)) return;
+  if (!k || !looksLikeRealValue(v)) return;
   out[k] = v;
 }
 
@@ -83,7 +78,8 @@ async function extractProduct(url: string) {
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
         if (!title) continue;
 
-        for (const li of root.querySelectorAll('ul.specification-keys > li.key-li')) {
+        const items = root.querySelectorAll('ul.specification-keys > li.key-li');
+        for (const li of items) {
           const key = clean(li.querySelector('.key-title')?.textContent || '');
           const value = clean(li.querySelector('.key-value')?.textContent || '');
           if (key && value) rows.push([key, value]);
@@ -98,6 +94,7 @@ async function extractProduct(url: string) {
         rootCount: roots.length,
         specFound: !!specRoot,
         sectionText: clean(specRoot?.innerText || '').slice(0, 15000),
+        html: specRoot?.outerHTML?.slice(0, 30000) || '',
         url: location.href
       };
     })()`);
@@ -106,13 +103,7 @@ async function extractProduct(url: string) {
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
     await context.close();
-    return {
-      specs,
-      finalUrl: result.url,
-      rootCount: result.rootCount,
-      specFound: result.specFound,
-      sectionText: result.sectionText
-    };
+    return { specs, finalUrl: result.url, ...result };
   } finally {
     await browser.close();
   }
@@ -121,118 +112,94 @@ async function extractProduct(url: string) {
 async function main() {
   await Actor.init();
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
+
+  const input = ((await Actor.getInput()) || {}) as Record<string, unknown>;
+  const productUrl = clean(input.productUrl || input.url || '', 2500);
+  if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required');
+
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false }
   });
+  const productId = productIdFromUrl(productUrl);
 
-  // Process all pending Daraz Nepal product URLs.
-  const pageSize = 200;
-  let offset = 0;
-  let totalSelected = 0;
-  let totalProcessed = 0;
-  let totalSaved = 0;
-  let totalNoSpecs = 0;
+  console.log(`SPEC_START | url=${productUrl}`);
+  const extracted = await extractProduct(productUrl);
+  console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
+  console.log(`SPEC_TITLE | found=${extracted.specFound} | text=${extracted.specFound ? 'Specifications' : ''}`);
+  console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
+  console.log(`SPEC_HTML | ${extracted.html}`);
+  console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
+  console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
 
-  while (true) {
-    const { data: pending, error } = await supabase
-      .from('products')
-      .select('id,title,link,created_at')
-      .not('link', 'is', null)
-      .like('link', '%daraz.com.np%')
-      .not('link', 'like', '%/categories/%')
-      .order('created_at', { ascending: true })
-      .range(offset, offset + pageSize - 1);
-    if (error) throw error;
-    if (!pending?.length) break;
+  const { data: existing, error: existingError } = await supabase
+    .from('products')
+    .select('id,title,price,image,link,reviews,rating,specifications')
+    .eq('link', productUrl)
+    .limit(1)
+    .maybeSingle();
+  if (existingError) throw existingError;
 
-    const candidates = pending.filter((p: any) => {
-      try {
-        const u = new URL(p.link);
-        return (u.hostname === DARAZ_HOST || u.hostname === `www.${DARAZ_HOST}`) && /\/products\//i.test(u.pathname) && /-i\d+\.html/i.test(u.pathname);
-      } catch {
-        return false;
+  const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
+    ? existing.specifications as Record<string, unknown>
+    : {};
+
+  if (!Object.keys(extracted.specs).length) {
+    await Actor.pushData({
+      url: productUrl,
+      status: 'no_verified_specs',
+      specifications: current,
+      diagnostic: {
+        rootCount: extracted.rootCount,
+        specFound: extracted.specFound,
+        sectionText: extracted.sectionText
       }
     });
-
-    for (const selected of candidates) {
-      const { data: already, error: alreadyError } = await supabase
-        .from('updated_specifications')
-        .select('id')
-        .eq('product_id', selected.id)
-        .limit(1)
-        .maybeSingle();
-      if (alreadyError) throw alreadyError;
-      if (already) continue;
-
-      totalSelected++;
-      const productUrl = clean(selected.link, 2500);
-      console.log(`SPEC_START | daraz_url=${productUrl} | product_id=${selected.id}`);
-
-      try {
-        const extracted = await extractProduct(productUrl);
-        const specs = extracted.specs;
-        totalProcessed++;
-
-        console.log(`SPEC_ROOT | found=${extracted.specFound} | count=${extracted.rootCount}`);
-        console.log(`SPEC_EXTRACTED | count=${Object.keys(specs).length} | final=${extracted.finalUrl}`);
-        console.log(`SPECIFICATIONS | ${JSON.stringify(specs)}`);
-
-        if (Object.keys(specs).length === 0) {
-          totalNoSpecs++;
-          await Actor.pushData({
-            url: productUrl,
-            status: 'no_verified_specs',
-            productId: selected.id,
-            specifications: {}
-          });
-          console.log(`SPEC_SKIP | product_id=${selected.id} | reason=no_verified_specs`);
-          continue;
-        }
-
-        const { error: saveError } = await supabase
-          .from('updated_specifications')
-          .upsert({
-            product_id: selected.id,
-            product_url: productUrl,
-            specifications: specs,
-            source: 'apify-specification',
-            updated_at: new Date().toISOString()
-          }, { onConflict: 'product_url' });
-        if (saveError) throw saveError;
-
-        totalSaved++;
-        await Actor.pushData({
-          url: productUrl,
-          status: 'updated',
-          productId: selected.id,
-          specifications: specs
-        });
-        console.log(`SPEC_DONE | saved=${Object.keys(specs).length} | table=updated_specifications | product_id=${selected.id}`);
-      } catch (err) {
-        totalProcessed++;
-        console.error(`SPEC_ERROR | product_id=${selected.id} | error=${String(err)}`);
-        await Actor.pushData({
-          url: productUrl,
-          status: 'error',
-          productId: selected.id,
-          error: String(err)
-        });
-      }
-    }
-
-    offset += pageSize;
-    if (pending.length < pageSize) break;
+    console.log('SPEC_DONE | no verified specs');
+    await Actor.exit();
+    return;
   }
 
+  const merged: Record<string, unknown> = { ...current, ...extracted.specs };
+  const payload = {
+    title: clean(existing?.title || input.title || 'Daraz Product', 500),
+    price: Number(existing?.price || 0),
+    currency: 'NPR',
+    image: existing?.image || null,
+    link: productUrl,
+    reviews: existing?.reviews ?? null,
+    rating: existing?.rating ?? null,
+    search_term: 'product-url-specification',
+    website: 'Daraz Nepal',
+    marketplace_id: MARKETPLACE_ID,
+    external_id: productId,
+    specifications: merged
+  };
+
+  const { data: saved, error: saveError } = await supabase
+    .from('products')
+    .upsert(payload, { onConflict: 'marketplace_id,external_id' })
+    .select('id')
+    .single();
+  if (saveError) throw saveError;
+
+  await supabase.from('product_enrichment_queue').upsert({
+    product_id: saved.id,
+    brand: merged.Brand || null,
+    model: merged.Model || null,
+    product_type: merged['Product Type'] || null,
+    parse_status: 'parsed',
+    reason: 'Apify product URL specification actor',
+    specifications: merged,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'product_id' });
+
   await Actor.pushData({
-    status: 'completed',
-    mode: 'all_pending_daraz',
-    selected: totalSelected,
-    processed: totalProcessed,
-    saved: totalSaved,
-    noVerifiedSpecs: totalNoSpecs
+    url: productUrl,
+    status: 'updated',
+    specifications: merged
   });
-  console.log(`SPEC_BATCH_DONE | selected=${totalSelected} | processed=${totalProcessed} | saved=${totalSaved} | no_verified_specs=${totalNoSpecs}`);
+
+  console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
 }
 
