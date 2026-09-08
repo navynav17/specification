@@ -27,6 +27,7 @@ const CANONICAL: Record<string, string> = {
   dimensions: 'Dimensions'
 };
 
+const SPEC_KEYS = /^(brand|brand name|model|model name|colour|color|color family|capacity|product type|type|warranty|warranty period|weight|dimension|dimensions|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i;
 const UI_NOISE = /^(more|from|no ratings?|ratings?|add to wishlist|share|report|quantity|out of stock|in stock|buy now|add to cart|sold by|delivery|cash on delivery|free shipping|emi|flash sale|choice|follow|chat now|message)$/i;
 const BAD_VALUE = /^(img|image|text|script|style|div|span|html|body|null|undefined)$/i;
 
@@ -44,8 +45,10 @@ function looksLikeRealValue(value: string) {
 }
 
 function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
-  const k = canonicalKey(clean(key, 120));
+  const rawKey = clean(key, 120);
+  const k = canonicalKey(rawKey);
   const v = clean(value, 350);
+  if (!SPEC_KEYS.test(rawKey)) return;
   if (!k || !looksLikeRealValue(v)) return;
   out[k] = v;
 }
@@ -57,18 +60,9 @@ function collectObjectPairs(node: unknown, out: Record<string, string>, depth = 
     return;
   }
   if (typeof node !== 'object') return;
-
-  const obj = node as Record<string, unknown>;
-  for (const [rawKey, rawValue] of Object.entries(obj)) {
-    if (typeof rawValue === 'string' || typeof rawValue === 'number' || typeof rawValue === 'boolean') {
-      const key = clean(rawKey, 120);
-      const value = clean(rawValue, 350);
-      if (/^(brand|brand name|model|model name|colour|color|color family|capacity|product type|type|warranty|warranty period|weight|dimension|dimensions|sku|storage|ram|display|screen|battery|camera|operating system|memory|processor|chipset|refresh rate|resolution|sim|network|material|power|voltage|frequency|number of doors|refrigerator type|refrigerator capacity|charging|charging speed|battery capacity|rom|internal storage|main camera|front camera|screen size|screen type|storage capacity|os version|graphics|gpu|cpu|connectivity|bluetooth|wifi|ports|usb|series|generation|processor speed|cores|threads|dedicated graphics|integrated graphics|screen resolution|panel type|touchscreen|backlit keyboard|keyboard layout|webcam|camera resolution|battery life)$/i.test(key)) {
-        addSpec(out, key, value);
-      }
-    } else {
-      collectObjectPairs(rawValue, out, depth + 1);
-    }
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') addSpec(out, key, value);
+    else collectObjectPairs(value, out, depth + 1);
   }
 }
 
@@ -90,9 +84,9 @@ async function extractProduct(url: string) {
       if (!interesting) return;
       try {
         const text = await response.text();
-        if (text && text.length <= 500000) {
+        if (text && text.length <= 750000) {
           networkPayloads.push({ url: responseUrl, contentType, text });
-          if (networkPayloads.length > 80) networkPayloads.shift();
+          if (networkPayloads.length > 120) networkPayloads.shift();
         }
       } catch {}
     });
@@ -109,7 +103,6 @@ async function extractProduct(url: string) {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
       const rows = [];
       const roots = Array.from(document.querySelectorAll('.pdp-mod-specification'));
-
       for (const root of roots) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
@@ -120,7 +113,6 @@ async function extractProduct(url: string) {
           if (key && value) rows.push([key, value]);
         }
       }
-
       return {
         rows,
         rootCount: roots.length,
@@ -138,8 +130,7 @@ async function extractProduct(url: string) {
 
     if (!Object.keys(specs).length) {
       const html = result.html as string;
-      const hasSpecMarkup = /pdp-mod-specification/i.test(html) && /specification-keys/i.test(html);
-      if (hasSpecMarkup) {
+      if (/pdp-mod-specification/i.test(html) && /specification-keys/i.test(html)) {
         console.log('SPEC_HTML_FALLBACK | exact specification markup detected in raw HTML');
         const rowRe = /<li[^>]*class=["'][^"']*\bkey-li\b[^"']*["'][^>]*>[\s\S]*?<span[^>]*class=["'][^"']*\bkey-title\b[^"']*["'][^>]*>([\s\S]*?)<\/span>[\s\S]*?<div[^>]*class=["'][^"']*\bkey-value\b[^"']*["'][^>]*>([\s\S]*?)<\/div>[\s\S]*?<\/li>/gi;
         const strip = (x: string) => clean(x.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' '));
@@ -150,30 +141,22 @@ async function extractProduct(url: string) {
     }
 
     if (!Object.keys(specs).length) {
+      let matchedPayloads = 0;
       for (const payload of networkPayloads) {
         if (!/(?:spec|attribute|product|sku|detail)/i.test(payload.url)) continue;
-        const text = payload.text;
         try {
-          const json = JSON.parse(text);
+          const json = JSON.parse(payload.text);
+          const before = Object.keys(specs).length;
           collectObjectPairs(json, specs);
-        } catch {
-          const pairs = text.match(/\"([^\"]{2,80})\"\s*:\s*\"([^\"]{1,350})\"/g) || [];
-          for (const pair of pairs) {
-            const match = pair.match(/^\"([^\"]{2,80})\"\s*:\s*\"([^\"]{1,350})\"$/);
-            if (match) addSpec(specs, match[1], match[2]);
+          if (Object.keys(specs).length > before) {
+            matchedPayloads++;
+            console.log(`SPEC_NETWORK_MATCH | url=${payload.url} | count=${Object.keys(specs).length}`);
           }
-        }
-        if (Object.keys(specs).length) {
-          console.log(`SPEC_NETWORK_MATCH | url=${payload.url} | count=${Object.keys(specs).length}`);
-          break;
-        }
+        } catch {}
       }
-    }
-
-    if (!Object.keys(specs).length) {
-      console.log(`SPEC_NETWORK_DIAGNOSTIC | captured=${networkPayloads.length}`);
-      for (const p of networkPayloads.slice(-30)) {
-        console.log(`SPEC_NETWORK | ${p.contentType} | ${p.url}`);
+      if (!Object.keys(specs).length && matchedPayloads === 0) {
+        console.log(`SPEC_NETWORK_DIAGNOSTIC | captured=${networkPayloads.length}`);
+        for (const p of networkPayloads.slice(-40)) console.log(`SPEC_NETWORK | ${p.contentType} | ${p.url}`);
       }
     }
 
@@ -192,16 +175,13 @@ async function main() {
   const productUrl = clean(input.productUrl || input.url || '', 2500);
   if (!/^https?:\/\//i.test(productUrl)) throw new Error('productUrl is required');
 
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false }
-  });
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
   const productId = productIdFromUrl(productUrl);
 
   console.log(`SPEC_START | url=${productUrl}`);
   const extracted = await extractProduct(productUrl);
   console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
   console.log(`SPEC_TITLE | found=${extracted.specFound} | text=${extracted.specFound ? 'Specifications' : ''}`);
-  console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.specFound ? 'Specifications section present' : '')}`);
   console.log(`SPEC_PAGE_TITLE | ${JSON.stringify(extracted.title)}`);
   console.log(`SPEC_BODY_SAMPLE | ${JSON.stringify(extracted.bodyTextSample)}`);
   console.log(`SPEC_HTML_LENGTH | ${extracted.html.length}`);
@@ -241,7 +221,6 @@ async function main() {
   const current = existing?.specifications && typeof existing.specifications === 'object' && !Array.isArray(existing.specifications)
     ? existing.specifications as Record<string, unknown>
     : {};
-
   const merged: Record<string, unknown> = { ...current, ...extracted.specs };
   const payload = {
     title: clean(existing?.title || input.title || 'Daraz Product', 500),
@@ -265,7 +244,7 @@ async function main() {
     .single();
   if (saveError) throw saveError;
 
-  await supabase.from('product_enrichment_queue').upsert({
+  const { error: queueError } = await supabase.from('product_enrichment_queue').upsert({
     product_id: saved.id,
     brand: merged.Brand || null,
     model: merged.Model || null,
@@ -275,13 +254,9 @@ async function main() {
     specifications: merged,
     updated_at: new Date().toISOString()
   }, { onConflict: 'product_id' });
+  if (queueError) throw queueError;
 
-  await Actor.pushData({
-    url: productUrl,
-    status: 'updated',
-    specifications: merged
-  });
-
+  await Actor.pushData({ url: productUrl, status: 'updated', specifications: merged });
   console.log(`SPEC_DONE | saved=${Object.keys(extracted.specs).length}`);
   await Actor.exit();
 }
