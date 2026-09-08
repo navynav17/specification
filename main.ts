@@ -6,8 +6,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://foupthwcnnskqlzhoyep.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MARKETPLACE_ID = process.env.MARKETPLACE_ID || '6a4f8822-e1bc-4e8b-be61-4d1a400f3c13';
 
-const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
-const productIdFromUrl = (url: string) => url.match(/(?:\/i|\/products\/[^?#]*?-i)(\d+)/i)?.[1] || url;
+const clean = (v: unknown, max = 500) => String(v ?? '').replace(/\\s+/g, ' ').trim().slice(0, max);
+const productIdFromUrl = (url: string) => url.match(/(?:\\/i|\\/products\\/[^?#]*?-i)(\\d+)/i)?.[1] || url;
 
 const CANONICAL: Record<string, string> = {
   brand: 'Brand',
@@ -38,8 +38,8 @@ function canonicalKey(key: string) {
 function looksLikeRealValue(value: string) {
   const v = clean(value, 350);
   if (!v || BAD_VALUE.test(v) || UI_NOISE.test(v)) return false;
-  if (/^https?:\/\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
-  if (/\b(no ratings?|add to wishlist|out of stock|in stock|more kitchen appliances|more .* from)/i.test(v)) return false;
+  if (/^https?:\\/\\//i.test(v) || /^data:/i.test(v) || /<[^>]+>/i.test(v)) return false;
+  if (/\\b(no ratings?|add to wishlist|out of stock|in stock|more kitchen appliances|more .* from)/i.test(v)) return false;
   return true;
 }
 
@@ -50,20 +50,8 @@ function addSpec(out: Record<string, string>, key: unknown, value: unknown) {
   out[k] = v;
 }
 
-function extractRowsFromHtml(html: string) {
-  const rows: Array<[string, string]> = [];
-  const liMatches = html.match(/<li\b[^>]*class=["'][^"']*key-li[^"']*["'][^>]*>[\s\S]*?<\/li>/gi) || [];
-  for (const li of liMatches) {
-    const key = clean((li.match(/<[^>]*class=["'][^"']*key-title[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1] || '').replace(/<[^>]+>/g, ''));
-    const value = clean((li.match(/<[^>]*class=["'][^"']*key-value[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1] || '').replace(/<[^>]+>/g, ''));
-    if (key && value) rows.push([key, value]);
-  }
-  return rows;
-}
-
 async function extractProduct(url: string) {
   const browser = await chromium.launch({ headless: true });
-  const networkBodies: Array<{ url: string; contentType: string; text: string }> = [];
   try {
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1200 },
@@ -71,69 +59,39 @@ async function extractProduct(url: string) {
       locale: 'en-US'
     });
     const page = await context.newPage();
-
-    page.on('response', async response => {
-      try {
-        const headers = response.headers();
-        const contentType = String(headers['content-type'] || '').toLowerCase();
-        const responseUrl = response.url();
-        if (!/json|javascript|html|text/i.test(contentType)) return;
-        if (!/daraz\.com\.np|lazada|api|product|sku|spec/i.test(responseUrl)) return;
-        const text = await response.text();
-        if (text && text.length < 1000000) {
-          networkBodies.push({ url: responseUrl, contentType, text });
-        }
-      } catch {}
-    });
-
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(5000);
+
     for (let i = 0; i < 7; i++) {
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(700);
     }
     await page.waitForTimeout(3000);
 
-    // Exact working Aura extractor remains the first extraction path.
+    // Primary path: the exact DOM structure that successfully extracted Aura.
     const result = await page.evaluate(`(() => {
       const clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();
-      const roots = Array.from(document.querySelectorAll('.pdp-mod-specification'));
       const rows = [];
+      const roots = Array.from(document.querySelectorAll('.pdp-mod-specification'));
 
       for (const root of roots) {
         const title = Array.from(root.querySelectorAll('.pdp-mod-section-title'))
           .find(el => clean(el.textContent).toLowerCase() === 'specifications');
         if (!title) continue;
 
-        const items = root.querySelectorAll('ul.specification-keys > li.key-li');
-        for (const li of items) {
+        for (const li of root.querySelectorAll('ul.specification-keys > li.key-li')) {
           const key = clean(li.querySelector('.key-title')?.textContent || '');
           const value = clean(li.querySelector('.key-value')?.textContent || '');
           if (key && value) rows.push([key, value]);
         }
       }
 
-      const allClassMatches = Array.from(document.querySelectorAll('[class*="pdp-mod-specification"]'))
-        .map(el => ({ tag: el.tagName, cls: el.className, text: clean(el.innerText || el.textContent || '').slice(0, 5000) }))
-        .slice(0, 20);
-
-      const specTextMatches = Array.from(document.querySelectorAll('body *'))
-        .filter(el => clean(el.textContent).toLowerCase() === 'specifications')
-        .map(el => ({ tag: el.tagName, cls: el.className, parent: el.parentElement?.className || '', text: clean(el.parentElement?.innerText || '').slice(0, 5000) }))
-        .slice(0, 20);
-
-      const specRoot = roots.find(root => Array.from(root.querySelectorAll('.pdp-mod-section-title'))
-        .some(el => clean(el.textContent).toLowerCase() === 'specifications')) || null;
-
       return {
         rows,
         rootCount: roots.length,
-        specFound: !!specRoot,
-        sectionText: clean(specRoot?.innerText || '').slice(0, 15000),
-        html: specRoot?.outerHTML?.slice(0, 30000) || '',
-        allClassMatches,
-        specTextMatches,
-        fullHtmlSample: document.documentElement.outerHTML.slice(0, 120000),
+        specFound: roots.some(root => Array.from(root.querySelectorAll('.pdp-mod-section-title'))
+          .some(el => clean(el.textContent).toLowerCase() === 'specifications')),
+        html: document.documentElement.outerHTML,
         title: document.title,
         bodyTextSample: clean(document.body?.innerText || '').slice(0, 12000),
         url: location.href
@@ -143,42 +101,8 @@ async function extractProduct(url: string) {
     const specs: Record<string, string> = {};
     for (const [k, v] of result.rows as Array<[string, string]>) addSpec(specs, k, v);
 
-    const htmlRows = extractRowsFromHtml(result.fullHtmlSample || '');
-    const htmlSpecs: Record<string, string> = {};
-    for (const [k, v] of htmlRows) addSpec(htmlSpecs, k, v);
-
-    // Network fallback: search captured JSON/text for known Daraz specification row patterns.
-    const networkSpecs: Record<string, string> = {};
-    const candidateResponses: Array<{ url: string; text: string }> = [];
-    for (const body of networkBodies) {
-      if (body.text.includes('specification') || body.text.includes('specifications') || body.text.includes('skuId')) {
-        candidateResponses.push({ url: body.url, text: body.text });
-      }
-      const matches = body.text.matchAll(/(?:"key"|"name"|"label")\s*:\s*"([^"]+)"\s*,\s*(?:"value"|"displayValue"|"text")\s*:\s*"([^"]+)"/gi);
-      for (const m of matches) addSpec(networkSpecs, m[1], m[2]);
-      const attrMatches = body.text.matchAll(/(?:"name"|"label")\s*:\s*"([^"]+)"[^{}]{0,300}?(?:"value"|"displayValue"|"text")\s*:\s*"([^"]+)"/gi);
-      for (const m of attrMatches) addSpec(networkSpecs, m[1], m[2]);
-    }
-
-    console.log(`SPEC_ALT_CLASS | ${JSON.stringify(result.allClassMatches)}`);
-    console.log(`SPEC_TEXT_MATCHES | ${JSON.stringify(result.specTextMatches)}`);
-    console.log(`SPEC_HTML_ROWS | ${JSON.stringify(htmlSpecs)}`);
-    console.log(`SPEC_NETWORK_RESPONSES | count=${candidateResponses.length}`);
-    for (const item of candidateResponses.slice(0, 10)) {
-      console.log(`SPEC_NETWORK | url=${item.url} | sample=${JSON.stringify(clean(item.text, 12000))}`);
-    }
-
-    const mergedSpecs = Object.keys(specs).length ? specs : (Object.keys(htmlSpecs).length ? htmlSpecs : networkSpecs);
-
     await context.close();
-    return {
-      specs: mergedSpecs,
-      exactSpecs: specs,
-      htmlSpecs,
-      networkSpecs,
-      finalUrl: result.url,
-      ...result
-    };
+    return { specs, finalUrl: result.url, ...result };
   } finally {
     await browser.close();
   }
@@ -201,15 +125,36 @@ async function main() {
   const extracted = await extractProduct(productUrl);
   console.log(`SPEC_ROOT | found=${extracted.rootCount > 0} | count=${extracted.rootCount}`);
   console.log(`SPEC_TITLE | found=${extracted.specFound} | text=${extracted.specFound ? 'Specifications' : ''}`);
-  console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.sectionText)}`);
-  console.log(`SPEC_HTML | ${extracted.html}`);
+  console.log(`SPEC_SECTION_TEXT | ${JSON.stringify(extracted.specFound ? 'Specifications section present' : '')}`);
   console.log(`SPEC_PAGE_TITLE | ${JSON.stringify(extracted.title)}`);
   console.log(`SPEC_BODY_SAMPLE | ${JSON.stringify(extracted.bodyTextSample)}`);
+  console.log(`SPEC_HTML_LENGTH | ${extracted.html.length}`);
+  console.log(`SPEC_HTML_HAS_SPEC_CLASS | ${/pdp-mod-specification/i.test(extracted.html)}`);
+  console.log(`SPEC_HTML_HAS_SPEC_ROWS | ${/specification-keys/i.test(extracted.html)}`);
   console.log(`SPEC_EXTRACTED | count=${Object.keys(extracted.specs).length} | final=${extracted.finalUrl}`);
-  console.log(`SPEC_EXACT | ${JSON.stringify(extracted.exactSpecs)}`);
-  console.log(`SPEC_HTML_FALLBACK | ${JSON.stringify(extracted.htmlSpecs)}`);
-  console.log(`SPEC_NETWORK_FALLBACK | ${JSON.stringify(extracted.networkSpecs)}`);
   console.log(`SPECIFICATIONS | ${JSON.stringify(extracted.specs)}`);
+
+  // HTML fallback: useful when Daraz includes the exact specification markup in source
+  // but does not attach/render that component into the live DOM seen by querySelectorAll.
+  if (!Object.keys(extracted.specs).length && /pdp-mod-specification/i.test(extracted.html)) {
+    console.log('SPEC_HTML_FALLBACK | exact specification markup detected in raw HTML');
+
+    const htmlMatch = extracted.html.match(/<div[^>]*class=["'][^"']*pdp-mod-specification[^"']*["'][\\s\\S]*?<\\/div><\\/div><\\/div>/i);
+    if (htmlMatch) {
+      const fragment = htmlMatch[0];
+      const rows: Array<[string, string]> = [];
+      const rowRe = /<li[^>]*class=["'][^"']*key-li[^"']*["'][\\s\\S]*?<span[^>]*class=["'][^"']*key-title[^"']*["'][^>]*>([\\s\\S]*?)<\\/span>[\\s\\S]*?<div[^>]*class=["'][^"']*key-value[^"']*["'][^>]*>([\\s\\S]*?)<\\/div>[\\s\\S]*?<\\/li>/gi;
+      let m: RegExpExecArray | null;
+      while ((m = rowRe.exec(fragment)) !== null) {
+        const strip = (x: string) => clean(x.replace(/<[^>]*>/g, ' '));
+        const key = strip(m[1]);
+        const value = strip(m[2]);
+        if (key && value) rows.push([key, value]);
+      }
+      for (const [k, v] of rows) addSpec(extracted.specs, k, v);
+      console.log(`SPEC_HTML_FALLBACK_EXTRACTED | count=${Object.keys(extracted.specs).length}`);
+    }
+  }
 
   if (!Object.keys(extracted.specs).length) {
     await Actor.pushData({
@@ -219,12 +164,11 @@ async function main() {
       diagnostic: {
         rootCount: extracted.rootCount,
         specFound: extracted.specFound,
-        sectionText: extracted.sectionText,
         finalUrl: extracted.finalUrl,
         title: extracted.title,
         bodyTextSample: extracted.bodyTextSample,
-        altClassMatches: extracted.allClassMatches,
-        specTextMatches: extracted.specTextMatches
+        htmlHasSpecClass: /pdp-mod-specification/i.test(extracted.html),
+        htmlHasSpecRows: /specification-keys/i.test(extracted.html)
       }
     });
     console.log('SPEC_DONE | no verified specs');
